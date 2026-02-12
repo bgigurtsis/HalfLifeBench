@@ -10,7 +10,14 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import AppConfig
 from .providers.base import BatchRequest, CompletionResult, Message, ModelProvider
-from .utils import append_jsonl_threadsafe, read_json, read_jsonl, read_text, write_json
+from .utils import (
+    append_jsonl_threadsafe,
+    read_json,
+    read_jsonl,
+    read_text,
+    write_json,
+    write_jsonl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +210,24 @@ def _judged_row_complete(row: Dict) -> bool:
 def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
     all_records = _load_all_run_records(config)
     probe_map = _load_probe_map(config)
+    filtered_records: List[Dict] = []
+    stale_probe_ids: Dict[str, int] = {}
+    for record in all_records:
+        probe_id = str(record.get("probe_id") or "")
+        if probe_id in probe_map:
+            filtered_records.append(record)
+            continue
+        stale_probe_ids[probe_id] = stale_probe_ids.get(probe_id, 0) + 1
+
+    if stale_probe_ids:
+        logger.info(
+            "Skipping stale raw records with unknown probe IDs: skipped=%d unique_probe_ids=%d sample_probe_ids=%s",
+            len(all_records) - len(filtered_records),
+            len(stale_probe_ids),
+            sorted(stale_probe_ids.keys())[:10],
+        )
+    all_records = filtered_records
+
     rng = random.Random(config.seed)
     max_workers = max(1, config.max_workers)
     total_records = len(all_records)
@@ -435,10 +460,15 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
             )
 
     # -- Cross-judge spot-check on 20% of LLM-scored items ----------------
+    # Only include rows whose probe_id exists in the current probe_map to
+    # avoid KeyErrors when legacy data (e.g. old A-E probes) is still present
+    # in judged.jsonl.
     llm_rows_idx = [
         idx
         for idx, row in enumerate(judged_rows)
-        if row is not None and row.get("judge_method") in {"llm", "rule_based_audit"}
+        if row is not None
+        and row.get("judge_method") in {"llm", "rule_based_audit"}
+        and row.get("probe_id") in probe_map
     ]
     cross_count = int(0.2 * len(llm_rows_idx))
     if len(llm_rows_idx) > 0 and cross_count == 0:
@@ -632,8 +662,14 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
             continue
         cross_rows.append(cross_row)
 
+    write_jsonl(judged_path, final_judged_rows)
     write_json(cross_results_path, cross_rows)
-    logger.info("Incremental judged rows stored in %s (new=%d)", judged_path, newly_written_judged)
+    logger.info(
+        "Wrote canonical judged rows: %s (count=%d new_this_run=%d)",
+        judged_path,
+        len(final_judged_rows),
+        newly_written_judged,
+    )
     logger.info("Wrote cross-judge results: %s (count=%d)", cross_results_path, len(cross_rows))
 
     audited_rows = [final_judged_rows[i] for i in sorted(audit_idx)]

@@ -464,6 +464,45 @@ def generate_report(config: AppConfig) -> Path:
       return dataset;
     }};
 
+    // -- Compute aggregate "Overall" line across all directives per depth ----
+    function computeOverallLine(rateKey, countKey) {{
+      // Collect all depth targets and aggregate pass counts / totals.
+      const byDepth = {{}};
+      directives.forEach((d) => {{
+        (SCORES.sweep_grid[d] || []).forEach((cell) => {{
+          const dt = cell.depth_target_tokens;
+          if (!byDepth[dt]) byDepth[dt] = {{ depthMean: 0, depthCount: 0, passes: 0, total: 0 }};
+          const n = cell[countKey] || cell.count || 0;
+          const rate = cell[rateKey];
+          if (typeof rate === "number" && n > 0) {{
+            byDepth[dt].passes += Math.round(rate * n);
+            byDepth[dt].total += n;
+          }}
+          byDepth[dt].depthMean += cell.depth_tokens_measured_mean;
+          byDepth[dt].depthCount += 1;
+        }});
+      }});
+      return Object.keys(byDepth)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .filter((dt) => byDepth[dt].total > 0)
+        .map((dt) => ({{
+          x: byDepth[dt].depthMean / byDepth[dt].depthCount,
+          y: byDepth[dt].passes / byDepth[dt].total,
+        }}));
+    }}
+
+    const overallStyle = {{
+      borderColor: "#000",
+      backgroundColor: "#000",
+      borderWidth: 3,
+      borderDash: [8, 4],
+      pointRadius: 4,
+      tension: 0.2,
+      parsing: false,
+    }};
+
+    // -- Sweep (all) chart ---------------------------------------------------
     const sweepDatasets = directives.map((d) => {{
       return decorateDirectiveLabel({{
         label: d,
@@ -474,6 +513,10 @@ def generate_report(config: AppConfig) -> Path:
         tension: 0.2
       }});
     }});
+    sweepDatasets.unshift(Object.assign({{
+      label: "Overall (all directives)",
+      data: computeOverallLine("pass_rate", "count"),
+    }}, overallStyle));
     new Chart(document.getElementById("sweepChart"), {{
       type: "line",
       data: {{ datasets: sweepDatasets }},
@@ -485,6 +528,7 @@ def generate_report(config: AppConfig) -> Path:
       }}
     }});
 
+    // -- Sweep (non-empty) chart ---------------------------------------------
     const sweepNonEmptyDatasets = directives.map((d) => {{
       return decorateDirectiveLabel({{
         label: d,
@@ -497,6 +541,10 @@ def generate_report(config: AppConfig) -> Path:
         tension: 0.2
       }});
     }});
+    sweepNonEmptyDatasets.unshift(Object.assign({{
+      label: "Overall (all directives)",
+      data: computeOverallLine("pass_rate_non_empty", "non_empty_count"),
+    }}, overallStyle));
     new Chart(document.getElementById("sweepNonEmptyChart"), {{
       type: "line",
       data: {{ datasets: sweepNonEmptyDatasets }},

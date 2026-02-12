@@ -51,7 +51,7 @@ class AppConfig:
     validate_judge_threshold: float = 0.8
     precheck_accuracy_threshold: float = 0.9
     cross_judge_warning_threshold: float = 0.85
-    max_workers: int = 5
+    max_workers: int = 30
 
 
 def load_config(root_dir: Path | None = None) -> AppConfig:
@@ -77,5 +77,5 @@ def load_config(root_dir: Path | None = None) -> AppConfig:
         repetitions=int(os.getenv("REPETITIONS", "20")),
         use_batch=_env_truthy("USE_BATCH", False),
         batch_poll_interval=int(os.getenv("BATCH_POLL_INTERVAL", "60")),
-        max_workers=int(os.getenv("MAX_WORKERS", "5")),
+        max_workers=int(os.getenv("MAX_WORKERS", "30")),
     )

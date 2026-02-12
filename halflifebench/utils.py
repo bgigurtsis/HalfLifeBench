@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import tiktoken
+
+logger = logging.getLogger(__name__)
 
 
 def ensure_dir(path: Path) -> None:
@@ -59,11 +62,14 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
         return []
     rows: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed JSONL row path=%s line=%d", path, line_number)
     return rows
 
 

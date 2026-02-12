@@ -62,6 +62,29 @@ and code when they diverge.
 
 ## Recent Implementation Notes
 
+### 2026-02-12 -- Fix judge resume robustness for stale raw rows and interrupted JSONL writes
+
+- Hardened `run_judging(...)` resume behavior against mixed-era raw datasets:
+  - filters loaded raw records to probe IDs present in current
+    `data/probes.json`.
+  - logs skipped unknown probe IDs (for example legacy `A*` rows) instead of
+    crashing during cross-judge lookup.
+- Hardened JSONL resume reads across the pipeline:
+  - `read_jsonl(...)` now skips malformed lines with a warning that includes
+    file path and line number.
+  - prevents resume failures when a prior run is interrupted mid-append and
+    leaves a truncated trailing line.
+- Added canonical end-of-run rewrite for judged output:
+  - `run_judging(...)` now rewrites `results/judged.jsonl` from in-memory
+    final rows after all judging/cross-judging completes.
+  - preserves crash-safe incremental appends during execution while preventing
+    duplicate accumulation across multiple resume cycles.
+- Files touched: `halflifebench/judge.py`, `halflifebench/utils.py`,
+  `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: rerunning `python run.py judge` now reliably resumes after
+  interrupted runs, skips stale legacy probe rows instead of failing with
+  `KeyError`, and produces deduplicated judged output for scoring/reporting.
+
 ### 2026-02-12 -- Add persistent auto commit/push workflow instruction
 
 - Added a persistent agent workflow rule to commit and push after each
@@ -481,6 +504,23 @@ and code when they diverge.
   `.cursor/rules/claude.mdc`.
 - User-visible: high-depth sweeps with parallel workers are resilient to 429
   TPM rate limits instead of crashing.
+
+### 2026-02-12 -- Fix legacy data contamination, dead refresh code, judge crash, and add consolidated chart line
+
+- Scorer now filters `judged.jsonl` to the current directive set from
+  `data/directives.json`. Legacy A-E rows are dropped with an INFO log.
+- Removed dead near-probe refresh scoring code (~40 lines) and the
+  `near_probe_refresh` key from `scores.json`.
+- Fixed `KeyError` crash in cross-judge spot-check when legacy probe IDs
+  are in `judged.jsonl` but not in `probes.json`. Cross-judge target pool
+  now filters on `probe_map` membership.
+- Added "Overall (all directives)" aggregate line (thick dashed black) to
+  both sweep charts in `report.py`, computed in JS by aggregating pass
+  counts across all directives per depth target.
+- Files touched: `halflifebench/scorer.py`, `halflifebench/judge.py`,
+  `halflifebench/report.py`, `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: report shows only D1-D10, no refresh section, no crash on
+  legacy probes, and charts include a consolidated overall compliance line.
 
 ## Documentation Sync Rule (Mandatory)
 

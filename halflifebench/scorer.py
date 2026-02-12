@@ -178,11 +178,34 @@ def _fit_logistic_regression(records: List[Dict], baseline_b: float) -> Dict:
     return result
 
 
+def _load_valid_directive_ids(config: AppConfig) -> set[str]:
+    """Return the set of directive IDs defined in data/directives.json."""
+    directives_path = config.data_dir / "directives.json"
+    if not directives_path.exists():
+        return set()
+    data = read_json(directives_path)
+    return {str(d["directive_id"]) for d in data if "directive_id" in d}
+
+
 def score_results(config: AppConfig) -> Dict:
     judged_path = config.results_dir / "judged.jsonl"
     rows = read_jsonl(judged_path)
     if not rows:
         raise FileNotFoundError("results/judged.jsonl not found or empty. Run judge first.")
+
+    # Filter to current directive set; discard legacy rows (e.g. old A-E data).
+    valid_ids = _load_valid_directive_ids(config)
+    if valid_ids:
+        pre_filter = len(rows)
+        rows = [r for r in rows if str(r.get("directive_id", "")).strip() in valid_ids]
+        dropped = pre_filter - len(rows)
+        if dropped:
+            logger.info(
+                "Filtered out %d legacy rows with directive IDs not in directives.json (kept %d)",
+                dropped,
+                len(rows),
+            )
+
     logger.info("Scoring results from %s records=%d", judged_path, len(rows))
 
     by_type: Dict[str, List[Dict]] = defaultdict(list)
@@ -320,50 +343,6 @@ def score_results(config: AppConfig) -> Dict:
             half_life[d]["fit_status"],
         )
 
-    # Near-probe refresh results.
-    refresh_rows = by_type.get("near_probe_refresh", [])
-    refresh_grid: Dict[str, Dict[str, List[Dict]]] = {}
-    if refresh_rows:
-        for gap in sorted({int(r.get("refresh_gap_tokens") or 0) for r in refresh_rows}):
-            gap_key = str(gap)
-            refresh_grid[gap_key] = {d: [] for d in directives}
-            for d in directives:
-                rows_d = [
-                    r
-                    for r in refresh_rows
-                    if r["directive_id"] == d and int(r.get("refresh_gap_tokens") or 0) == gap
-                ]
-                by_depth = defaultdict(list)
-                for r in rows_d:
-                    by_depth[int(r["depth_target_tokens"])].append(r)
-                for depth_target in sorted(by_depth.keys()):
-                    depth_rows = by_depth[depth_target]
-                    pass_rate = _rate(depth_rows)
-                    pass_rate_non_empty, empty_count, non_empty_count = _rate_non_empty(depth_rows)
-                    refresh_grid[gap_key][d].append(
-                        {
-                            "depth_target_tokens": depth_target,
-                            "depth_tokens_measured_mean": mean(
-                                [float(x.get("depth_tokens_measured", 0.0)) for x in depth_rows]
-                            ),
-                            "pass_rate": pass_rate,
-                            "pass_rate_non_empty": pass_rate_non_empty,
-                            "count": len(depth_rows),
-                            "non_empty_count": non_empty_count,
-                            "empty_count": empty_count,
-                        }
-                    )
-                    logger.debug(
-                        "Refresh grid gap=%s directive=%s depth_target=%d count=%d pass_rate=%.4f pass_rate_non_empty=%s empty_count=%d",
-                        gap_key,
-                        d,
-                        depth_target,
-                        len(depth_rows),
-                        pass_rate,
-                        f"{pass_rate_non_empty:.4f}" if pass_rate_non_empty is not None else "n/a",
-                        empty_count,
-                    )
-
     judge_summary = {}
     validate_judge = {}
     judge_summary_path = config.results_dir / "judge_summary.json"
@@ -409,7 +388,6 @@ def score_results(config: AppConfig) -> Dict:
         "baseline_counts": baseline_counts,
         "sweep_grid": sweep_grid,
         "half_life": half_life,
-        "near_probe_refresh": refresh_grid,
         "empty_response_stats": empty_response_stats,
         "judge_quality": {
             "validate_judge": validate_judge,
