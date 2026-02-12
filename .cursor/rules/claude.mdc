@@ -6,19 +6,18 @@ alwaysApply: true
 # HalfLifeBench PoC
 
 A Python CLI benchmark measuring how SOC policy directive adherence decays as
-conversational context grows. Model-agnostic, currently targeting GPT-5 mini
-(model-under-test) and Claude Opus 4.6 (judge).
+conversational context grows. Model-agnostic, currently targeting GPT-4.1-nano
+(model-under-test) and Claude Sonnet 4.5 (judge).
 
 ## Key Concepts
 
-- **Directives A-E**: five SOC policies injected via system/developer prompt.
-  A=Secrets, B=Least privilege, C=Approval gating, D=Log integrity, E=No fabrication.
+- **Directives D1-D10**: ten SOC policies injected via system/developer prompt.
+- **Model defaults**: `OPENAI_MODEL=gpt-4.1-nano`, `ANTHROPIC_MODEL=claude-sonnet-4-5`.
 - **depth_tokens_measured**: authoritative metric derived from the API's
   `request_input_tokens_total`, not tiktoken. tiktoken is planning-only.
 - **Half-life**: depth where pass rate drops below 50% of the depth-0 baseline (B).
   Not the logistic midpoint.
-- **Near-probe refresh**: PoC variant of Experiment C -- single policy reinjection
-  N tokens before the probe, not periodic reinjection.
+- **Current run profile**: baselines + sweep only (near-probe refresh removed).
 
 ## Project Layout
 
@@ -27,7 +26,7 @@ halflifebench/         # Core library
   config.py            # Depth targets, model IDs, seed
   providers/           # Model abstraction (OpenAI + Anthropic)
   filler.py            # Filler generation + validation
-  runner.py            # Baselines, sweep, refresh
+  runner.py            # Baselines and sweep
   judge.py             # CoT-aware parsing, rule-based pre-check, spot-check
   scorer.py            # Pass rates, half-life, logistic fit
   report.py            # Self-contained HTML report generator
@@ -43,7 +42,7 @@ run.py                 # CLI entry point
 - All analysis uses `depth_tokens_measured` (API-derived), never tiktoken estimates.
 - Judge verdicts are PASS/FAIL JSON with CoT. Parse the last JSON block from output.
 - Default to FAIL on any ambiguity (judge parse failure, low confidence, etc.).
-- Filler validation must cover all 5 directives (keyword blacklist), not just secrets.
+- Filler validation must cover all 10 directives (keyword blacklist), not just secrets.
 
 ## Reference
 
@@ -53,12 +52,310 @@ design decisions, data file inventory, and provider abstraction -- all at
 multiple levels of detail with mermaid diagrams.
 
 `deep-research-report.md` contains the full research design (10 directives,
-100 probes, 3 experiments, cost models). The PoC is a deliberate subset:
-5 directives, 25 probes, 5 depth checkpoints, single-refresh mitigation.
-The report is useful context but does not match the PoC spec exactly --
-always prefer the plan and code over the report when they diverge.
+100 probes, 3 experiments, cost models). The report is useful context but does
+not always match the current implementation exactly -- always prefer the plan
+and code when they diverge.
 
 ## Recent Implementation Notes
+
+### 2026-02-12 -- Verification follow-up: README sync and legacy directive-map correction
+
+- Completed a post-migration consistency pass after the D1-D10 rollout:
+  - rewrote `README.md` to the current 6-stage pipeline profile
+    (no near-probe refresh run stage), D1-D10 directives, 50 probes, and
+    10 depth checkpoints with 10 repetitions.
+  - corrected `LEGACY_DIRECTIVE_ID_MAP` in
+    `halflifebench/judge_comparison.py` to match the current canonical mapping:
+    `A->D1`, `B->D3`, `C->D4`, `D->D5`, `E->D8`.
+  - clarified `compare-judges` CLI help text in `run.py` that
+    `claude-opus-4-6` remains the default comparator model intentionally.
+- Validation:
+  - `python run.py --help` and `python run.py compare-judges --help` both pass.
+  - stale README references to old near-probe command/profile removed.
+- Files touched: `README.md`, `halflifebench/judge_comparison.py`, `run.py`,
+  `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: documentation and judge-comparison legacy normalization now
+  align with the implemented D1-D10 benchmark configuration.
+
+### 2026-02-12 -- Add compare-judges command for Sonnet vs Opus judge equivalence
+
+- Added a new model-comparison workflow for judging quality:
+  - `halflifebench/judge_comparison.py` runs both judge models on the same
+    examples and computes side-by-side metrics.
+  - golden-set metrics: per-model agreement (overall + per-directive),
+    inter-model agreement, Cohen's kappa, and McNemar p-value.
+  - optional sweep sample metrics: inter-model agreement/kappa on sampled
+    `results/raw/sweep.jsonl` rows, plus disagreement listings.
+- Added CLI entry point in `run.py`:
+  - `python run.py compare-judges --model-a ... --model-b ... [--include-sweep N]`
+  - output written to `results/judge_comparison.json`.
+- Updated `judge_once(...)` in `halflifebench/judge.py`:
+  - optional `model` override parameter for comparing multiple judges
+  - new `judge_parse_success` field in returned structured result for
+    reliability diagnostics.
+- Exported `compare_judges` from `halflifebench/__init__.py`.
+- Files touched: `halflifebench/judge_comparison.py`, `run.py`,
+  `halflifebench/judge.py`, `halflifebench/__init__.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: users can directly test whether Sonnet 4.5 matches Opus 4.6
+  as a judge before changing default model configuration.
+
+### 2026-02-12 -- Switch benchmark to GPT-4.1-nano + D1-D10 and remove refresh runs
+
+- Reconfigured defaults and core data assets to match the 10-directive profile:
+  - `openai_model`: `gpt-4.1-nano`
+  - `anthropic_model`: `claude-sonnet-4-5`
+  - `repetitions`: `10`
+  - depth targets: `0, 8k, 32k, 50k, 64k, 80k, 100k, 128k, 200k, 256k`.
+- Replaced benchmark data files:
+  - `data/directives.json` (D1-D10)
+  - `data/probes.json` (50 probes; 5 per directive)
+  - `data/system_prompt.txt` (D1-D10 prompt)
+  - `data/judge_prompts/header.txt` + `d1.txt` to `d10.txt`
+  - `data/golden_set.json` expanded to 50 validation examples.
+- Updated runtime flow to remove near-probe refresh execution:
+  - removed refresh logic from `runner.py`
+  - removed `--near-probe-refresh` from `run.py`
+  - `all` pipeline now runs 6 steps (generate-filler, validate-judge,
+    baselines, sweep, judge, report).
+- Updated scoring/report/judge logic for D1-D10 directive IDs:
+  - D1 canary auto-fail shortcut in `judge.py`
+  - dynamic directive handling in `scorer.py` and `report.py`.
+- Expanded filler blacklist coverage for D2/D6/D7/D9/D10 in `filler.py`.
+- Files touched: `halflifebench/config.py`, `halflifebench/runner.py`,
+  `halflifebench/judge.py`, `halflifebench/scorer.py`,
+  `halflifebench/report.py`, `halflifebench/filler.py`, `run.py`,
+  `.env.example`, `data/directives.json`, `data/probes.json`,
+  `data/system_prompt.txt`, `data/judge_prompts/*`, `data/golden_set.json`,
+  `AGENTS.md`, `.cursor/rules/claude.mdc`, `ARCHITECTURE.md`.
+- User-visible: benchmark now targets GPT-4.1-nano + Claude Sonnet 4.5 with
+  10 directives, 50 probes, 10 depth checkpoints, and 10 repetitions; refresh
+  experiments are skipped.
+
+### 2026-02-12 -- Replace aggregated curve_fit with per-record logistic regression inference
+
+- Reworked half-life fitting from `scipy.optimize.curve_fit` on aggregated
+  sweep pass-rate points to `statsmodels.Logit` on pooled non-empty binary
+  sweep records per directive.
+- `scores.json` half-life entries now include inferential fields:
+  - slope/intercept terms (`beta0`, `beta1`) and uncertainty
+    (`beta1_se`, `beta1_pvalue`)
+  - likelihood-ratio test against a flat (intercept-only) model
+    (`lr_statistic`, `lr_pvalue`)
+  - fitted half-life confidence interval
+    (`x_half_ci_lower`, `x_half_ci_upper`)
+  - non-empty sample counts (`n_observations`, `n_pass`, `n_fail`)
+- Added fit-status handling for perfect compliance/failure, convergence
+  failures, non-significant/no-decay patterns, and beyond-range half-life.
+- Updated `report.py` half-life table columns to show beta slope, p-values,
+  LR-test p-value, fitted half-life CI, and non-empty sample size.
+- Added `statsmodels` dependency in `requirements.txt`.
+- Files touched: `halflifebench/scorer.py`, `halflifebench/report.py`,
+  `requirements.txt`, `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: report + scores now include statistical decay evidence and
+  confidence intervals, not just descriptive fitted half-life values.
+
+### 2026-02-12 -- Change default reasoning effort from low to medium
+
+- Changed default reasoning effort to `medium` across config/provider defaults:
+  - `AppConfig.reasoning_effort` now defaults to `"medium"`.
+  - `REASONING_EFFORT` env fallback now uses `"medium"`.
+  - `ModelProvider`, `OpenAIProvider`, and `AnthropicProvider` defaults now
+    use `"medium"` for interface consistency.
+  - `OpenAIProvider` invalid `reasoning_effort` fallback now defaults to
+    `"medium"`.
+- Files touched: `halflifebench/config.py`,
+  `halflifebench/providers/base.py`,
+  `halflifebench/providers/openai_provider.py`,
+  `halflifebench/providers/anthropic_provider.py`,
+  `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: benchmark runs now default to medium reasoning effort unless
+  overridden with `REASONING_EFFORT`.
+
+### 2026-02-12 -- Implement per-cell repetitions (deep report aligned: n=8)
+
+- Added repetition controls in config and CLI:
+  - `AppConfig.repetitions` (default `8`, env `REPETITIONS`).
+  - New top-level `-r` / `--repetitions` flag in `run.py`.
+  - Config loading now applies both workers and repetitions overrides.
+- Reworked `runner.py` task construction from probe-centric loops to
+  (directive, repetition)-centric sampling:
+  - probes are grouped by directive, then selected via cycling
+    (`rep_idx % len(directive_probes)`).
+  - baselines, sweep, and near-probe refresh now all execute exactly
+    `repetitions` calls per (directive, depth) cell.
+- Added repetition metadata to raw records:
+  - `run_id` now includes repetition suffix `:r{repetition_index}`.
+  - records now include `repetition_index` and `effective_seed`.
+  - provider calls use per-repetition seed variation (`config.seed + rep_idx`).
+- Files touched: `halflifebench/config.py`, `halflifebench/runner.py`,
+  `run.py`, `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: runs now support configurable per-cell repetitions (default 8)
+  from env/CLI; output records are repetition-aware and include effective seed.
+
+### 2026-02-12 -- Fix GPT-5 mini empty/incomplete responses via token budget + reasoning controls
+
+- Root cause addressed: GPT-5 mini reasoning tokens were consuming the
+  `max_output_tokens=700` budget, causing frequent `status="incomplete"`
+  responses with empty visible output.
+- Increased output budget and added reasoning controls:
+  - `max_output_tokens` default changed from `700` to `16000`.
+  - Added `reasoning_effort` config (`REASONING_EFFORT`, default `"low"`).
+- Updated OpenAI provider behavior:
+  - Responses API requests now include `reasoning={"effort": ...}`.
+  - Empty+incomplete retries now double the token budget each retry, instead
+    of repeating with the same budget.
+  - Existing diagnostics retained: `metadata.reasoning_tokens` and
+    `metadata.incomplete_details`.
+- Updated provider interface wiring:
+  - Added `reasoning_effort` to `ModelProvider.complete(...)`.
+  - `runner.py` now passes `config.reasoning_effort`.
+  - `AnthropicProvider` accepts/ignores `reasoning_effort` for protocol
+    compatibility.
+- Files touched: `halflifebench/config.py`,
+  `halflifebench/providers/openai_provider.py`,
+  `halflifebench/providers/base.py`,
+  `halflifebench/providers/anthropic_provider.py`,
+  `halflifebench/runner.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: markedly fewer empty outputs expected from GPT-5 mini and
+  safer automatic retries for empty incomplete responses.
+
+### 2026-02-12 -- Retry incomplete empty outputs + instrument reasoning tokens + separate empty outcome reporting
+
+- Added minimal retry behavior for Responses API calls that return
+  `status: "incomplete"` with empty text output:
+  - New `max_empty_retries` config knob (default `2`, env
+    `MAX_EMPTY_RETRIES`).
+  - `OpenAIProvider.complete()` now retries these empty incomplete results
+    before returning.
+- Added missing diagnosis instrumentation per record:
+  - `metadata.incomplete_details.reason`
+  - `metadata.reasoning_tokens` sourced from usage token details
+    (`output_tokens_details.reasoning_tokens` on Responses API; fallback to
+    Chat `completion_tokens_details.reasoning_tokens` where available).
+  - Runner debug logging now includes incomplete reason and reasoning tokens.
+- Updated scoring/reporting to treat empty outputs as a separate outcome
+  rather than folding them into a single pass/fail metric:
+  - sweep/refresh cells now include `pass_rate` (all responses),
+    `pass_rate_non_empty`, `empty_count`, and `non_empty_count`.
+  - baseline outputs now include all-response and non-empty breakout rates.
+  - report adds empty/non-empty baseline columns, empty/non-empty sweep
+    columns, a non-empty sweep chart, and an empty-response-rate-by-depth
+    chart.
+- Files touched: `halflifebench/config.py`,
+  `halflifebench/providers/base.py`,
+  `halflifebench/providers/anthropic_provider.py`,
+  `halflifebench/providers/openai_provider.py`, `halflifebench/runner.py`,
+  `halflifebench/judge.py`, `halflifebench/scorer.py`,
+  `halflifebench/report.py`, `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: fewer empty-result failures due to automatic retry, richer
+  per-record API diagnostics, and scientifically cleaner reporting that
+  separates empty outputs from compliance outcomes.
+
+### 2026-02-12 -- Exclude empty responses from scoring and report quality metrics
+
+- Added `response_empty` tagging in run records and backward-compatible
+  backfill during judging:
+  - `runner.py` now writes `response_empty` for each model output.
+  - `judge.py` now computes `response_empty` when the field is missing.
+- Updated `scorer.py` to exclude empty responses from all compliance
+  calculations:
+  - baseline, sweep, and near-probe refresh pass rates now use non-empty
+    responses only.
+  - half-life fitting excludes sweep cells with zero non-empty responses.
+  - each sweep/refresh cell now reports `total_count`, `non_empty_count`,
+    `empty_count`, and `empty_rate`.
+  - `scores.json` now includes top-level `empty_response_stats`.
+- Updated `report.py` to reflect the scoring policy and data quality:
+  - added a report note that empty responses are excluded from pass-rate
+    and half-life metrics.
+  - baseline table now includes scored sample sizes.
+  - sweep grid now includes `N (total)` and `N (scored)`.
+  - added "Empty Response Rates" tables by run type and directive.
+- Files touched: `halflifebench/runner.py`, `halflifebench/judge.py`,
+  `halflifebench/scorer.py`, `halflifebench/report.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: compliance metrics now represent non-empty responses only,
+  with explicit empty-response data-quality reporting in the HTML report.
+
+### 2026-02-12 -- Results evaluation document (EVALUATION.md, Run 2)
+
+- Rewrote `EVALUATION.md` with Run 2 results: 480 records, n=8 per cell,
+  0% empty responses, 93.5% sweep pass rate, 100% cross-judge agreement,
+  no measurable decay up to 256k tokens. D and E at 100% all depths;
+  A weakest at 82.5% (not depth-correlated). Half-lives exceed tested range.
+- Files touched: `EVALUATION.md`, `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: updated evaluation reflecting clean Run 2 data.
+
+### 2026-02-12 -- Fix _supports_param_error pattern matching and deduplicate discovery logs
+
+- Added `"unsupported parameter"` and `"is not supported"` to the
+  `_supports_param_error` substring checks so API-level 400 errors
+  (e.g. `"Unsupported parameter: 'temperature' is not supported"`) are
+  correctly detected. Fixes Responses API retry falling through to Chat
+  Completions on every parallel call.
+- Added `was_new` dedup guards to all 8 discovery log sites so only the
+  first thread to discover an unsupported param logs the INFO message.
+- Files touched: `halflifebench/providers/openai_provider.py`.
+- User-visible: no more WARNING-level fallback spam in parallel runs;
+  1-2 INFO lines on first call, silence thereafter.
+
+### 2026-02-12 -- Parallel API calls via ThreadPoolExecutor
+
+- All API-calling stages now run in parallel using `ThreadPoolExecutor`:
+  baselines, sweep, near-probe refresh, judging (primary + cross-judge),
+  and validate-judge.
+- New `max_workers: int = 5` in `AppConfig`, loaded from `MAX_WORKERS` env var.
+- New `-w` / `--workers` CLI flag (top-level, applies to all subcommands).
+  `--workers 1` disables parallelism.
+- `OpenAIProvider` now uses a `threading.Lock` to protect mutable fallback
+  caches for thread safety.
+- Baselines: first probe sequential (overhead calibration), rest parallel.
+- Sweep/refresh: filler pre-loaded, all (depth, probe) pairs submitted at once.
+- Judging: auto-fail sync, LLM calls + cross-judge calls parallel.
+- Output ordering preserved via index-based collection.
+- Files touched: `halflifebench/config.py`, `run.py`,
+  `halflifebench/providers/openai_provider.py`, `halflifebench/runner.py`,
+  `halflifebench/judge.py`.
+- User-visible: ~5x faster pipeline (bounded by rate limits); new `--workers`
+  flag; `max_workers` logged at phase start.
+
+### 2026-02-12 -- Fix OpenAI provider repeated warning spam
+
+- Added `_responses_param_support_by_model` cache to `OpenAIProvider` so
+  the Responses API remembers which params a model supports (mirrors the
+  existing `_chat_param_support_by_model` for Chat Completions).
+- Fixed Responses API retry to handle both `seed` and `temperature` being
+  unsupported (was falling through to Chat Completions instead of trying
+  with both disabled).
+- Now always sets `_use_responses_api_by_model[model] = False` on any
+  Responses API fallback, not just the narrow seed-keyword case.
+- Downgraded param-discovery logs from WARNING to INFO; fallback message
+  stays WARNING.
+- Files touched: `halflifebench/providers/openai_provider.py`.
+- User-visible: no more repeated warning spam during sweeps; first probe
+  emits 1-2 INFO + 1 WARNING, subsequent probes emit zero warnings.
+
+### 2026-02-12 -- Extended depth targets to 400k
+
+- Added `400000` to `depth_targets` in `halflifebench/config.py` (now 6
+  checkpoints: 0, 8k, 32k, 128k, 256k, 400k) to cover GPT-5 mini's full
+  400k context window.
+- No other code changes; all pipeline stages iterate `config.depth_targets`.
+- Requires re-running `generate-filler` to create `depth_400000.json`.
+- Files touched: `halflifebench/config.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`, `ARCHITECTURE.md`.
+
+### 2026-02-12 -- README and ARCHITECTURE documentation polish
+
+- Rewrote `README.md` CLI section with detailed per-command explanations
+  (purpose, outputs, pipeline role) and structured outputs table.
+- Polished `ARCHITECTURE.md` for readability: tighter prose, better list
+  formatting, dependency-graph legend, numbered judge mechanisms, richer
+  module descriptions, cross-reference to README.
+- Files touched: `README.md`, `ARCHITECTURE.md`.
+- No code changes; documentation only.
 
 ### 2026-02-11 -- Runtime logging added across all CLI commands
 

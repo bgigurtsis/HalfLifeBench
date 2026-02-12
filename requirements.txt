@@ -4,3 +4,4 @@ tiktoken
 python-dotenv
 scipy
 numpy
+statsmodels

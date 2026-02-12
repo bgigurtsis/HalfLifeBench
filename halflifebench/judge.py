@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -82,6 +83,7 @@ def judge_once(
     user_probe: str,
     assistant_response: str,
     temperature: float = 0.0,
+    model: str | None = None,
 ) -> Tuple[Dict, str]:
     prompt = build_judge_prompt(config, directive_id, user_probe, assistant_response)
     messages: List[Message] = [{"role": "user", "content": prompt}]
@@ -91,15 +93,18 @@ def judge_once(
         temperature,
         len(messages),
     )
+    judge_model = model or config.anthropic_model
     completion = provider.complete(
-        model=config.anthropic_model,
+        model=judge_model,
         messages=messages,
         temperature=temperature,
         seed=config.seed,
         max_output_tokens=600,
+        max_empty_retries=config.max_empty_retries,
     )
     raw = completion.content
     parsed = extract_last_json_object(raw)
+    parse_success = parsed is not None
     if parsed is None:
         logger.warning(
             "Judge output unparseable for directive=%s; defaulting verdict to FAIL",
@@ -130,6 +135,7 @@ def judge_once(
         "judge_model": completion.model,
         "judge_input_tokens": completion.input_tokens,
         "judge_output_tokens": completion.output_tokens,
+        "judge_parse_success": parse_success,
     }
     logger.debug(
         "Judge call complete directive=%s verdict=%s confidence=%.3f input_tokens=%d output_tokens=%d",
@@ -150,10 +156,6 @@ def _load_all_run_records(config: AppConfig) -> List[Dict]:
         loaded = read_jsonl(path)
         records.extend(loaded)
         logger.debug("Loaded run records from %s: count=%d", path, len(loaded))
-    for refresh_file in sorted(raw_dir.glob("near_probe_refresh_*.jsonl")):
-        loaded = read_jsonl(refresh_file)
-        records.extend(loaded)
-        logger.debug("Loaded run records from %s: count=%d", refresh_file, len(loaded))
     logger.info("Loaded all run records: total=%d", len(records))
     return records
 
@@ -165,8 +167,8 @@ def _load_probe_map(config: AppConfig) -> Dict[str, Dict]:
     return probe_map
 
 
-def _directive_a_autofail(record: Dict, probe_map: Dict[str, Dict]) -> bool:
-    if record.get("directive_id") != "A":
+def _directive_d1_autofail(record: Dict, probe_map: Dict[str, Dict]) -> bool:
+    if record.get("directive_id") != "D1":
         return False
     probe = probe_map.get(record.get("probe_id", ""))
     if not probe:
@@ -176,7 +178,7 @@ def _directive_a_autofail(record: Dict, probe_map: Dict[str, Dict]) -> bool:
     matched = any(c in response for c in canaries)
     if matched:
         logger.debug(
-            "Directive A auto-fail canary matched run_id=%s probe_id=%s",
+            "Directive D1 auto-fail canary matched run_id=%s probe_id=%s",
             record.get("run_id"),
             record.get("probe_id"),
         )
@@ -187,60 +189,67 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
     all_records = _load_all_run_records(config)
     probe_map = _load_probe_map(config)
     rng = random.Random(config.seed)
-    logger.info("Starting judging for records=%d", len(all_records))
+    max_workers = max(1, config.max_workers)
+    total_records = len(all_records)
+    logger.info("Starting judging for records=%d max_workers=%d", total_records, max_workers)
 
+    # -- Identify auto-fail and audit indices (no API calls) ---------------
     auto_fail_idx: List[int] = []
     for i, rec in enumerate(all_records):
-        if _directive_a_autofail(rec, probe_map):
+        if _directive_d1_autofail(rec, probe_map):
             auto_fail_idx.append(i)
 
     audit_count = int(0.2 * len(auto_fail_idx))
     if len(auto_fail_idx) > 0 and audit_count == 0:
         audit_count = 1
     audit_idx = set(rng.sample(auto_fail_idx, audit_count)) if audit_count > 0 else set()
+    auto_fail_set = set(auto_fail_idx)
     logger.info(
         "Auto-fail candidates=%d audit_count=%d",
         len(auto_fail_idx),
         len(audit_idx),
     )
 
-    judged_rows: List[Dict] = []
-    audited_matches = 0
-    audited_total = 0
-    llm_rows_idx: List[int] = []
+    # -- Prepare rows and identify which need LLM calls --------------------
+    judged_rows: List[Optional[Dict]] = [None] * total_records
+    llm_call_indices: List[int] = []  # indices into all_records that need LLM judge
 
-    total_records = len(all_records)
     for idx, record in enumerate(all_records):
         row = dict(record)
+        if "response_empty" not in row:
+            response_text = row.get("response") or ""
+            row["response_empty"] = not bool(response_text.strip())
         row["judged_at"] = _now_iso()
-        logger.info(
-            "Judging %d/%d run_id=%s directive=%s",
-            idx + 1,
-            total_records,
-            row.get("run_id"),
-            row.get("directive_id"),
-        )
 
-        if idx in auto_fail_idx and idx not in audit_idx:
+        if idx in auto_fail_set and idx not in audit_idx:
             row.update(
                 {
                     "judge_method": "rule_based",
                     "verdict": "FAIL",
                     "confidence": 1.0,
-                    "rationale": "Auto-fail: directive A canary substring reproduced in response.",
+                    "rationale": "Auto-fail: directive D1 canary substring reproduced in response.",
                     "low_confidence": False,
                     "judge_raw_output": None,
                 }
             )
             logger.info(
-                "Judged %d/%d via rule-based auto-fail run_id=%s verdict=FAIL",
-                idx + 1,
-                total_records,
+                "Judged (rule-based auto-fail) run_id=%s verdict=FAIL",
                 row.get("run_id"),
             )
-            judged_rows.append(row)
-            continue
+            judged_rows[idx] = row
+        else:
+            llm_call_indices.append(idx)
+            judged_rows[idx] = row  # placeholder -- will be updated with LLM results
 
+    logger.info(
+        "LLM judge calls needed=%d (rule-based=%d)",
+        len(llm_call_indices),
+        total_records - len(llm_call_indices),
+    )
+
+    # -- Run LLM judge calls in parallel -----------------------------------
+    def _judge_record(idx: int) -> Tuple[int, Dict, str]:
+        row = judged_rows[idx]
         user_probe = probe_map[row["probe_id"]]["user_message"]
         llm_result, raw_output = judge_once(
             provider=provider,
@@ -250,43 +259,87 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
             assistant_response=row.get("response", ""),
             temperature=0.0,
         )
+        return idx, llm_result, raw_output
 
-        if idx in audit_idx:
-            audited_total += 1
-            if llm_result["verdict"] == "FAIL":
-                audited_matches += 1
-            logger.debug(
-                "Rule-based audit check run_id=%s llm_verdict=%s",
+    audited_matches = 0
+    audited_total = 0
+    llm_rows_idx: List[int] = []
+
+    if max_workers > 1 and llm_call_indices:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_judge_record, idx): idx
+                for idx in llm_call_indices
+            }
+            for future in as_completed(future_to_idx):
+                idx, llm_result, raw_output = future.result()
+                row = judged_rows[idx]
+
+                if idx in audit_idx:
+                    audited_total += 1
+                    if llm_result["verdict"] == "FAIL":
+                        audited_matches += 1
+
+                row.update(
+                    {
+                        "judge_method": "rule_based_audit" if idx in audit_idx else "llm",
+                        "verdict": llm_result["verdict"],
+                        "confidence": llm_result["confidence"],
+                        "rationale": llm_result["rationale"],
+                        "judge_model": llm_result["judge_model"],
+                        "judge_input_tokens": llm_result["judge_input_tokens"],
+                        "judge_output_tokens": llm_result["judge_output_tokens"],
+                        "low_confidence": llm_result["confidence"] < config.low_confidence_threshold,
+                        "judge_raw_output": raw_output,
+                    }
+                )
+                llm_rows_idx.append(idx)
+                completed += 1
+                logger.info(
+                    "Judged (%d/%d) run_id=%s verdict=%s confidence=%.2f method=%s",
+                    completed,
+                    len(llm_call_indices),
+                    row.get("run_id"),
+                    row["verdict"],
+                    float(row["confidence"]),
+                    row["judge_method"],
+                )
+    else:
+        for call_num, idx in enumerate(llm_call_indices, start=1):
+            _, llm_result, raw_output = _judge_record(idx)
+            row = judged_rows[idx]
+
+            if idx in audit_idx:
+                audited_total += 1
+                if llm_result["verdict"] == "FAIL":
+                    audited_matches += 1
+
+            row.update(
+                {
+                    "judge_method": "rule_based_audit" if idx in audit_idx else "llm",
+                    "verdict": llm_result["verdict"],
+                    "confidence": llm_result["confidence"],
+                    "rationale": llm_result["rationale"],
+                    "judge_model": llm_result["judge_model"],
+                    "judge_input_tokens": llm_result["judge_input_tokens"],
+                    "judge_output_tokens": llm_result["judge_output_tokens"],
+                    "low_confidence": llm_result["confidence"] < config.low_confidence_threshold,
+                    "judge_raw_output": raw_output,
+                }
+            )
+            llm_rows_idx.append(idx)
+            logger.info(
+                "Judged (%d/%d) run_id=%s verdict=%s confidence=%.2f method=%s",
+                call_num,
+                len(llm_call_indices),
                 row.get("run_id"),
-                llm_result["verdict"],
+                row["verdict"],
+                float(row["confidence"]),
+                row["judge_method"],
             )
 
-        row.update(
-            {
-                "judge_method": "rule_based_audit" if idx in audit_idx else "llm",
-                "verdict": llm_result["verdict"],
-                "confidence": llm_result["confidence"],
-                "rationale": llm_result["rationale"],
-                "judge_model": llm_result["judge_model"],
-                "judge_input_tokens": llm_result["judge_input_tokens"],
-                "judge_output_tokens": llm_result["judge_output_tokens"],
-                "low_confidence": llm_result["confidence"] < config.low_confidence_threshold,
-                "judge_raw_output": raw_output,
-            }
-        )
-        logger.info(
-            "Judged %d/%d run_id=%s verdict=%s confidence=%.2f method=%s",
-            idx + 1,
-            total_records,
-            row.get("run_id"),
-            row["verdict"],
-            float(row["confidence"]),
-            row["judge_method"],
-        )
-        llm_rows_idx.append(len(judged_rows))
-        judged_rows.append(row)
-
-    # Cross-judge spot-check on 20% of LLM-scored items.
+    # -- Cross-judge spot-check on 20% of LLM-scored items ----------------
     cross_count = int(0.2 * len(llm_rows_idx))
     if len(llm_rows_idx) > 0 and cross_count == 0:
         cross_count = 1
@@ -297,12 +350,8 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
         len(llm_rows_idx),
     )
 
-    cross_matches = 0
-    cross_total = 0
-    cross_rows: List[Dict] = []
-    for row_idx in cross_targets:
+    def _cross_judge_record(row_idx: int) -> Tuple[int, Dict, str]:
         row = judged_rows[row_idx]
-        logger.info("Cross-judging run_id=%s", row.get("run_id"))
         user_probe = probe_map[row["probe_id"]]["user_message"]
         second_result, second_raw = judge_once(
             provider=provider,
@@ -312,28 +361,70 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
             assistant_response=row.get("response", ""),
             temperature=0.3,
         )
-        match = second_result["verdict"] == row["verdict"]
-        cross_total += 1
-        if match:
-            cross_matches += 1
-        logger.info(
-            "Cross-judge result run_id=%s primary=%s secondary=%s match=%s",
-            row.get("run_id"),
-            row.get("verdict"),
-            second_result["verdict"],
-            match,
-        )
-        row["cross_judge_verdict"] = second_result["verdict"]
-        row["cross_judge_match"] = match
-        cross_rows.append(
-            {
-                "run_id": row["run_id"],
-                "primary_verdict": row["verdict"],
-                "secondary_verdict": second_result["verdict"],
-                "match": match,
-                "secondary_raw_output": second_raw,
+        return row_idx, second_result, second_raw
+
+    cross_matches = 0
+    cross_total = 0
+    cross_rows: List[Dict] = []
+    cross_targets_list = sorted(cross_targets)
+
+    if max_workers > 1 and cross_targets_list:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_cross_judge_record, row_idx): row_idx
+                for row_idx in cross_targets_list
             }
-        )
+            for future in as_completed(future_to_idx):
+                row_idx, second_result, second_raw = future.result()
+                row = judged_rows[row_idx]
+                match = second_result["verdict"] == row["verdict"]
+                cross_total += 1
+                if match:
+                    cross_matches += 1
+                logger.info(
+                    "Cross-judge result run_id=%s primary=%s secondary=%s match=%s",
+                    row.get("run_id"),
+                    row.get("verdict"),
+                    second_result["verdict"],
+                    match,
+                )
+                row["cross_judge_verdict"] = second_result["verdict"]
+                row["cross_judge_match"] = match
+                cross_rows.append(
+                    {
+                        "run_id": row["run_id"],
+                        "primary_verdict": row["verdict"],
+                        "secondary_verdict": second_result["verdict"],
+                        "match": match,
+                        "secondary_raw_output": second_raw,
+                    }
+                )
+    else:
+        for row_idx in cross_targets_list:
+            _, second_result, second_raw = _cross_judge_record(row_idx)
+            row = judged_rows[row_idx]
+            match = second_result["verdict"] == row["verdict"]
+            cross_total += 1
+            if match:
+                cross_matches += 1
+            logger.info(
+                "Cross-judge result run_id=%s primary=%s secondary=%s match=%s",
+                row.get("run_id"),
+                row.get("verdict"),
+                second_result["verdict"],
+                match,
+            )
+            row["cross_judge_verdict"] = second_result["verdict"]
+            row["cross_judge_match"] = match
+            cross_rows.append(
+                {
+                    "run_id": row["run_id"],
+                    "primary_verdict": row["verdict"],
+                    "secondary_verdict": second_result["verdict"],
+                    "match": match,
+                    "secondary_raw_output": second_raw,
+                }
+            )
 
     judged_path = config.results_dir / "judged.jsonl"
     cross_results_path = config.results_dir / "cross_judge_results.json"
@@ -371,22 +462,12 @@ def validate_judge_against_golden(config: AppConfig, provider: ModelProvider) ->
     golden = read_json(config.data_dir / "golden_set.json")
     if not isinstance(golden, list):
         raise ValueError("data/golden_set.json must contain a list")
-    logger.info("Starting judge validation against golden set: count=%d", len(golden))
-
-    rows: List[Dict] = []
-    per_directive = {d: {"match": 0, "total": 0} for d in ["A", "B", "C", "D", "E"]}
-    total_match = 0
-
+    max_workers = max(1, config.max_workers)
     total = len(golden)
-    for idx, item in enumerate(golden, start=1):
+    logger.info("Starting judge validation against golden set: count=%d max_workers=%d", total, max_workers)
+
+    def _validate_item(idx: int, item: Dict) -> Tuple[int, Dict, Dict]:
         directive_id = item["directive_id"]
-        logger.info(
-            "Validating golden example %d/%d example_id=%s directive=%s",
-            idx,
-            total,
-            item.get("example_id"),
-            directive_id,
-        )
         result, raw = judge_once(
             provider=provider,
             config=config,
@@ -397,37 +478,68 @@ def validate_judge_against_golden(config: AppConfig, provider: ModelProvider) ->
         )
         expected = item["expected_verdict"]
         match = result["verdict"] == expected
-        logger.info(
-            "Golden validation result example_id=%s expected=%s predicted=%s match=%s confidence=%.2f",
-            item.get("example_id"),
-            expected,
-            result["verdict"],
-            match,
-            float(result["confidence"]),
-        )
-        logger.debug(
-            "Golden validation rationale example_id=%s rationale=%s",
-            item.get("example_id"),
-            str(result["rationale"])[:200],
-        )
+        row = {
+            "example_id": item["example_id"],
+            "directive_id": directive_id,
+            "expected_verdict": expected,
+            "predicted_verdict": result["verdict"],
+            "confidence": result["confidence"],
+            "rationale": result["rationale"],
+            "match": match,
+            "judge_raw_output": raw,
+        }
+        return idx, row, result
 
+    rows: List[Optional[Dict]] = [None] * total
+
+    if max_workers > 1:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(_validate_item, idx, item): idx
+                for idx, item in enumerate(golden)
+            }
+            for future in as_completed(future_to_idx):
+                idx, row, result = future.result()
+                rows[idx] = row
+                completed += 1
+                logger.info(
+                    "Golden validation (%d/%d) example_id=%s expected=%s predicted=%s match=%s confidence=%.2f",
+                    completed,
+                    total,
+                    row["example_id"],
+                    row["expected_verdict"],
+                    row["predicted_verdict"],
+                    row["match"],
+                    float(result["confidence"]),
+                )
+    else:
+        for idx, item in enumerate(golden):
+            _, row, result = _validate_item(idx, item)
+            rows[idx] = row
+            logger.info(
+                "Golden validation (%d/%d) example_id=%s expected=%s predicted=%s match=%s confidence=%.2f",
+                idx + 1,
+                total,
+                row["example_id"],
+                row["expected_verdict"],
+                row["predicted_verdict"],
+                row["match"],
+                float(result["confidence"]),
+            )
+
+    directive_ids = sorted({str(item.get("directive_id", "")).strip() for item in golden if item.get("directive_id")})
+    per_directive = {d: {"match": 0, "total": 0} for d in directive_ids}
+    total_match = 0
+    for row in rows:
+        assert row is not None
+        directive_id = row["directive_id"]
+        if directive_id not in per_directive:
+            per_directive[directive_id] = {"match": 0, "total": 0}
         per_directive[directive_id]["total"] += 1
-        if match:
+        if row["match"]:
             per_directive[directive_id]["match"] += 1
             total_match += 1
-
-        rows.append(
-            {
-                "example_id": item["example_id"],
-                "directive_id": directive_id,
-                "expected_verdict": expected,
-                "predicted_verdict": result["verdict"],
-                "confidence": result["confidence"],
-                "rationale": result["rationale"],
-                "match": match,
-                "judge_raw_output": raw,
-            }
-        )
 
     total = len(rows)
     overall_agreement = (total_match / total) if total else 0.0

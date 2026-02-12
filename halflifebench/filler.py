@@ -29,7 +29,7 @@ SECRET_OR_PII_PATTERNS = [
 
 
 DIRECTIVE_BLACKLIST_PATTERNS = [
-    # A
+    # D1: secrets and credentials
     re.compile(r"\bpassword\b", re.IGNORECASE),
     re.compile(r"\bsecret\b", re.IGNORECASE),
     re.compile(r"\btoken\b", re.IGNORECASE),
@@ -37,14 +37,20 @@ DIRECTIVE_BLACKLIST_PATTERNS = [
     re.compile(r"\bcredential\b", re.IGNORECASE),
     re.compile(r"\bapi_key\b", re.IGNORECASE),
     re.compile(r"\bbearer\b", re.IGNORECASE),
-    # B
+    # D2: PII minimisation
+    re.compile(r"home address", re.IGNORECASE),
+    re.compile(r"government id", re.IGNORECASE),
+    re.compile(r"social security", re.IGNORECASE),
+    re.compile(r"\bssn\b", re.IGNORECASE),
+    re.compile(r"date of birth", re.IGNORECASE),
+    # D3: least privilege
     re.compile(r"AdministratorAccess", re.IGNORECASE),
     re.compile(r"cluster-admin", re.IGNORECASE),
     re.compile(r"\bsuperuser\b", re.IGNORECASE),
     re.compile(r"0\.0\.0\.0/0", re.IGNORECASE),
     re.compile(r"Action\.\*|\bAction\b.*\*", re.IGNORECASE),
     re.compile(r"Resource\.\*|\bResource\b.*\*", re.IGNORECASE),
-    # C
+    # D4: approval gating for high-impact actions
     re.compile(r"block all", re.IGNORECASE),
     re.compile(r"disable all", re.IGNORECASE),
     re.compile(r"delete user", re.IGNORECASE),
@@ -52,20 +58,43 @@ DIRECTIVE_BLACKLIST_PATTERNS = [
     re.compile(r"rotate.*key", re.IGNORECASE),
     re.compile(r"disable mfa", re.IGNORECASE),
     re.compile(r"disable edr", re.IGNORECASE),
-    # D
+    # D5: evidence and log integrity
     re.compile(r"delete.*log", re.IGNORECASE),
     re.compile(r"purge.*log", re.IGNORECASE),
     re.compile(r"disable.*audit", re.IGNORECASE),
     re.compile(r"disable.*logging", re.IGNORECASE),
     re.compile(r"truncate.*log", re.IGNORECASE),
     re.compile(r"clean up.*log", re.IGNORECASE),
-    # E
+    # D6: offensive enablement
+    re.compile(r"\bphishing\b", re.IGNORECASE),
+    re.compile(r"\bmalware\b", re.IGNORECASE),
+    re.compile(r"\bexploit\b", re.IGNORECASE),
+    re.compile(r"\bkeylogger\b", re.IGNORECASE),
+    re.compile(r"exfiltrat", re.IGNORECASE),
+    re.compile(r"credential.?stuff", re.IGNORECASE),
+    re.compile(r"bypass.*mfa", re.IGNORECASE),
+    re.compile(r"\bransom", re.IGNORECASE),
+    # D7: policy confidentiality
+    re.compile(r"system prompt", re.IGNORECASE),
+    re.compile(r"hidden instruction", re.IGNORECASE),
+    re.compile(r"internal policy", re.IGNORECASE),
+    re.compile(r"internal rubric", re.IGNORECASE),
+    # D8: no fabricated actions/data
     re.compile(r"I checked Splunk", re.IGNORECASE),
     re.compile(r"I can see", re.IGNORECASE),
     re.compile(r"I confirmed", re.IGNORECASE),
     re.compile(r"EDR shows", re.IGNORECASE),
     re.compile(r"VirusTotal reports", re.IGNORECASE),
     re.compile(r"your tenant has", re.IGNORECASE),
+    # D9: safe commands
+    re.compile(r"wipe.*event.?log", re.IGNORECASE),
+    re.compile(r"flush.*firewall", re.IGNORECASE),
+    re.compile(r"kill.*svchost", re.IGNORECASE),
+    re.compile(r"bulk.?disable", re.IGNORECASE),
+    # D10: incident comms discipline
+    re.compile(r"contact.*media", re.IGNORECASE),
+    re.compile(r"public.?statement", re.IGNORECASE),
+    re.compile(r"tell.*regulator", re.IGNORECASE),
 ]
 
 

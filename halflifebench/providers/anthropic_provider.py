@@ -22,8 +22,12 @@ class AnthropicProvider:
         temperature: float = 0.0,
         seed: int | None = None,  # Anthropic messages API does not currently use seed.
         max_output_tokens: int = 700,
+        reasoning_effort: str = "medium",
+        max_empty_retries: int = 0,
     ) -> CompletionResult:
         del seed
+        del reasoning_effort
+        del max_empty_retries
         logger.debug(
             "Anthropic complete start model=%s messages=%d max_output_tokens=%d temperature=%.3f",
             model,

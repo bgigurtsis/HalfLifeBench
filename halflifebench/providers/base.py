@@ -25,5 +25,7 @@ class ModelProvider(Protocol):
         temperature: float = 0.0,
         seed: int | None = None,
         max_output_tokens: int = 700,
+        reasoning_effort: str = "medium",
+        max_empty_retries: int = 0,
     ) -> CompletionResult:
         ...
