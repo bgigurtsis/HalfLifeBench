@@ -1,0 +1,87 @@
+---
+description: HalfLifeBench project context and conventions
+alwaysApply: true
+---
+
+# HalfLifeBench PoC
+
+A Python CLI benchmark measuring how SOC policy directive adherence decays as
+conversational context grows. Model-agnostic, currently targeting GPT-5 mini
+(model-under-test) and Claude Opus 4.6 (judge).
+
+## Key Concepts
+
+- **Directives A-E**: five SOC policies injected via system/developer prompt.
+  A=Secrets, B=Least privilege, C=Approval gating, D=Log integrity, E=No fabrication.
+- **depth_tokens_measured**: authoritative metric derived from the API's
+  `request_input_tokens_total`, not tiktoken. tiktoken is planning-only.
+- **Half-life**: depth where pass rate drops below 50% of the depth-0 baseline (B).
+  Not the logistic midpoint.
+- **Near-probe refresh**: PoC variant of Experiment C -- single policy reinjection
+  N tokens before the probe, not periodic reinjection.
+
+## Project Layout
+
+```
+halflifebench/         # Core library
+  config.py            # Depth targets, model IDs, seed
+  providers/           # Model abstraction (OpenAI + Anthropic)
+  filler.py            # Filler generation + validation
+  runner.py            # Baselines, sweep, refresh
+  judge.py             # CoT-aware parsing, rule-based pre-check, spot-check
+  scorer.py            # Pass rates, half-life, logistic fit
+  report.py            # Self-contained HTML report generator
+data/                  # Static assets (probes, directives, judge prompts, golden set)
+results/               # Generated output (gitignored)
+run.py                 # CLI entry point
+```
+
+## Conventions
+
+- Python 3.11+. Type hints everywhere. No classes where a function suffices.
+- API keys in `.env` (never committed). Use `python-dotenv`.
+- All analysis uses `depth_tokens_measured` (API-derived), never tiktoken estimates.
+- Judge verdicts are PASS/FAIL JSON with CoT. Parse the last JSON block from output.
+- Default to FAIL on any ambiguity (judge parse failure, low confidence, etc.).
+- Filler validation must cover all 5 directives (keyword blacklist), not just secrets.
+
+## Reference
+
+`ARCHITECTURE.md` is the primary architecture document. It covers the research
+question, conceptual model, pipeline stages, module dependency graph, key
+design decisions, data file inventory, and provider abstraction -- all at
+multiple levels of detail with mermaid diagrams.
+
+`deep-research-report.md` contains the full research design (10 directives,
+100 probes, 3 experiments, cost models). The PoC is a deliberate subset:
+5 directives, 25 probes, 5 depth checkpoints, single-refresh mitigation.
+The report is useful context but does not match the PoC spec exactly --
+always prefer the plan and code over the report when they diverge.
+
+## Recent Implementation Notes
+
+### 2026-02-11 -- Runtime logging added across all CLI commands
+
+- Added centralized logging setup in `run.py` with timestamped output.
+- Added `-v` / `--verbose` flag in `run.py` to switch from INFO to DEBUG.
+- Replaced CLI status prints with logger calls for consistent real-time output.
+- Added progress and diagnostic logging in:
+  - `halflifebench/filler.py`
+  - `halflifebench/runner.py`
+  - `halflifebench/judge.py`
+  - `halflifebench/scorer.py`
+  - `halflifebench/report.py`
+- Added provider-level debug/warning logs in:
+  - `halflifebench/providers/openai_provider.py`
+  - `halflifebench/providers/anthropic_provider.py`
+
+## Documentation Sync Rule (Mandatory)
+
+- After every code change or bug fix, update both:
+  - `.cursor/rules/claude.mdc`
+  - `AGENTS.md`
+- Treat documentation sync as required completion criteria for the task.
+- Each update must include:
+  - what changed
+  - key files touched
+  - user-visible behavior changes (CLI/logging/flags/output)
