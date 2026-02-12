@@ -58,6 +58,62 @@ and code when they diverge.
 
 ## Recent Implementation Notes
 
+### 2026-02-12 -- Report cleanup: remove dead refresh section, add summary and run config metadata
+
+- Removed dead "Near-probe policy refresh" chart card and JS from the HTML
+  report (refresh runs were removed from the pipeline earlier but the report
+  still rendered an empty chart and JS for them).
+- Removed `refresh_dataset_count` computation from `generate_report()`.
+- Added run configuration metadata to the report header: repetitions/cell,
+  depth checkpoint count, and reasoning effort now display alongside model
+  names and generation timestamp.
+- `scorer.py` now writes a `run_config` block into `scores.json` containing
+  `repetitions`, `depth_targets`, `max_output_tokens`, `reasoning_effort`,
+  `max_workers`, `use_batch`, `seed`, and `temperature`.
+- Added a Summary section at the top of the report with at-a-glance cards:
+  total records, sweep records, overall sweep pass rate (all), max depth,
+  depth checkpoints, and significant-decay directive count.
+- Files touched: `halflifebench/report.py`, `halflifebench/scorer.py`,
+  `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: report.html no longer shows an empty refresh chart; header
+  includes run parameters; new summary cards provide an immediate overview.
+
+### 2026-02-12 -- Add batch mode + expand probe/golden coverage and default study density
+
+- Added end-to-end Batch API support (OpenAI + Anthropic) via the provider abstraction:
+  - new `ModelProvider.complete_batch(...)` protocol and `BatchRequest` type.
+  - `OpenAIProvider.complete_batch(...)` now writes JSONL input, submits
+    `/v1/chat/completions` batches, polls status, downloads output JSONL,
+    and maps `custom_id` rows into `CompletionResult`.
+  - `AnthropicProvider.complete_batch(...)` now submits message batches, polls
+    `processing_status`, streams results, and maps each item into
+    `CompletionResult`.
+- Updated execution flow for both benchmark and judging:
+  - `runner.py` now supports batch-mode baselines and sweep with preserved row
+    ordering and unchanged depth token accounting.
+  - `judge.py` now supports batch-mode `validate_judge_against_golden(...)` and
+    `run_judging(...)`, including cross-judge spot-check batch calls.
+- Updated defaults and controls:
+  - `repetitions` default changed from `10` to `20`.
+  - depth targets now include low-mid checkpoints:
+    `0, 4k, 8k, 16k, 32k, 48k, 50k, 64k, 80k, 100k, 128k, 200k, 256k`.
+  - new config/env settings: `USE_BATCH`, `BATCH_POLL_INTERVAL`.
+  - new CLI flags: `--batch` / `--no-batch`.
+- Expanded benchmark data:
+  - `data/probes.json` expanded from 50 to 100 probes (10 per directive).
+  - `data/golden_set.json` expanded from 50 to 100 examples.
+  - `.env.example` updated with batch settings and `REPETITIONS=20` comment.
+- Files touched: `halflifebench/config.py`,
+  `halflifebench/providers/base.py`,
+  `halflifebench/providers/openai_provider.py`,
+  `halflifebench/providers/anthropic_provider.py`,
+  `halflifebench/providers/__init__.py`, `halflifebench/runner.py`,
+  `halflifebench/judge.py`, `run.py`, `data/probes.json`,
+  `data/golden_set.json`, `.env.example`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: `--batch` enables async lower-cost runs, defaults now run denser
+  experiments (20 reps, 13 depths), and judge validation/probe coverage doubled.
+
 ### 2026-02-12 -- Verification follow-up: README sync and legacy directive-map correction
 
 - Completed a post-migration consistency pass after the D1-D10 rollout:

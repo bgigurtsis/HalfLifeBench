@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .config import AppConfig
-from .providers.base import Message, ModelProvider
+from .providers.base import BatchRequest, CompletionResult, Message, ModelProvider
 from .utils import read_json, read_jsonl, read_text, write_json, write_jsonl
 
 logger = logging.getLogger(__name__)
@@ -75,33 +75,11 @@ def extract_last_json_object(text: str) -> Optional[Dict]:
     return None
 
 
-def judge_once(
+def _judge_result_from_completion(
     *,
-    provider: ModelProvider,
-    config: AppConfig,
     directive_id: str,
-    user_probe: str,
-    assistant_response: str,
-    temperature: float = 0.0,
-    model: str | None = None,
+    completion: CompletionResult,
 ) -> Tuple[Dict, str]:
-    prompt = build_judge_prompt(config, directive_id, user_probe, assistant_response)
-    messages: List[Message] = [{"role": "user", "content": prompt}]
-    logger.debug(
-        "Judge call starting directive=%s temperature=%.1f message_count=%d",
-        directive_id,
-        temperature,
-        len(messages),
-    )
-    judge_model = model or config.anthropic_model
-    completion = provider.complete(
-        model=judge_model,
-        messages=messages,
-        temperature=temperature,
-        seed=config.seed,
-        max_output_tokens=600,
-        max_empty_retries=config.max_empty_retries,
-    )
     raw = completion.content
     parsed = extract_last_json_object(raw)
     parse_success = parsed is not None
@@ -146,6 +124,36 @@ def judge_once(
         completion.output_tokens,
     )
     return result, raw
+
+
+def judge_once(
+    *,
+    provider: ModelProvider,
+    config: AppConfig,
+    directive_id: str,
+    user_probe: str,
+    assistant_response: str,
+    temperature: float = 0.0,
+    model: str | None = None,
+) -> Tuple[Dict, str]:
+    prompt = build_judge_prompt(config, directive_id, user_probe, assistant_response)
+    messages: List[Message] = [{"role": "user", "content": prompt}]
+    logger.debug(
+        "Judge call starting directive=%s temperature=%.1f message_count=%d",
+        directive_id,
+        temperature,
+        len(messages),
+    )
+    judge_model = model or config.anthropic_model
+    completion = provider.complete(
+        model=judge_model,
+        messages=messages,
+        temperature=temperature,
+        seed=config.seed,
+        max_output_tokens=600,
+        max_empty_retries=config.max_empty_retries,
+    )
+    return _judge_result_from_completion(directive_id=directive_id, completion=completion)
 
 
 def _load_all_run_records(config: AppConfig) -> List[Dict]:
@@ -265,7 +273,77 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
     audited_total = 0
     llm_rows_idx: List[int] = []
 
-    if max_workers > 1 and llm_call_indices:
+    if config.use_batch and llm_call_indices:
+        logger.info(
+            "Judging batch mode enabled: submitting primary judge batch requests=%d poll_interval=%d",
+            len(llm_call_indices),
+            config.batch_poll_interval,
+        )
+        primary_requests: List[BatchRequest] = []
+        idx_to_custom: Dict[int, str] = {}
+        for idx in llm_call_indices:
+            row = judged_rows[idx]
+            user_probe = probe_map[row["probe_id"]]["user_message"]
+            prompt = build_judge_prompt(
+                config=config,
+                directive_id=row["directive_id"],
+                user_probe=user_probe,
+                assistant_response=row.get("response", ""),
+            )
+            custom_id = f"judge_primary-{idx}-{row['probe_id']}"
+            idx_to_custom[idx] = custom_id
+            primary_requests.append(
+                {
+                    "custom_id": custom_id,
+                    "model": config.anthropic_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "seed": config.seed,
+                    "max_output_tokens": 600,
+                }
+            )
+
+        primary_results = provider.complete_batch(
+            requests=primary_requests,
+            poll_interval=config.batch_poll_interval,
+        )
+        for call_num, idx in enumerate(llm_call_indices, start=1):
+            row = judged_rows[idx]
+            completion = primary_results[idx_to_custom[idx]]
+            llm_result, raw_output = _judge_result_from_completion(
+                directive_id=row["directive_id"],
+                completion=completion,
+            )
+
+            if idx in audit_idx:
+                audited_total += 1
+                if llm_result["verdict"] == "FAIL":
+                    audited_matches += 1
+
+            row.update(
+                {
+                    "judge_method": "rule_based_audit" if idx in audit_idx else "llm",
+                    "verdict": llm_result["verdict"],
+                    "confidence": llm_result["confidence"],
+                    "rationale": llm_result["rationale"],
+                    "judge_model": llm_result["judge_model"],
+                    "judge_input_tokens": llm_result["judge_input_tokens"],
+                    "judge_output_tokens": llm_result["judge_output_tokens"],
+                    "low_confidence": llm_result["confidence"] < config.low_confidence_threshold,
+                    "judge_raw_output": raw_output,
+                }
+            )
+            llm_rows_idx.append(idx)
+            logger.info(
+                "Judged (%d/%d) run_id=%s verdict=%s confidence=%.2f method=%s",
+                call_num,
+                len(llm_call_indices),
+                row.get("run_id"),
+                row["verdict"],
+                float(row["confidence"]),
+                row["judge_method"],
+            )
+    elif max_workers > 1 and llm_call_indices:
         completed = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
@@ -368,7 +446,70 @@ def run_judging(config: AppConfig, provider: ModelProvider) -> Dict:
     cross_rows: List[Dict] = []
     cross_targets_list = sorted(cross_targets)
 
-    if max_workers > 1 and cross_targets_list:
+    if config.use_batch and cross_targets_list:
+        logger.info(
+            "Judging batch mode enabled: submitting cross-judge batch requests=%d poll_interval=%d",
+            len(cross_targets_list),
+            config.batch_poll_interval,
+        )
+        cross_requests: List[BatchRequest] = []
+        row_to_custom: Dict[int, str] = {}
+        for row_idx in cross_targets_list:
+            row = judged_rows[row_idx]
+            user_probe = probe_map[row["probe_id"]]["user_message"]
+            prompt = build_judge_prompt(
+                config=config,
+                directive_id=row["directive_id"],
+                user_probe=user_probe,
+                assistant_response=row.get("response", ""),
+            )
+            custom_id = f"judge_cross-{row_idx}-{row['probe_id']}"
+            row_to_custom[row_idx] = custom_id
+            cross_requests.append(
+                {
+                    "custom_id": custom_id,
+                    "model": config.anthropic_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "seed": config.seed,
+                    "max_output_tokens": 600,
+                }
+            )
+
+        cross_results = provider.complete_batch(
+            requests=cross_requests,
+            poll_interval=config.batch_poll_interval,
+        )
+        for row_idx in cross_targets_list:
+            row = judged_rows[row_idx]
+            completion = cross_results[row_to_custom[row_idx]]
+            second_result, second_raw = _judge_result_from_completion(
+                directive_id=row["directive_id"],
+                completion=completion,
+            )
+            match = second_result["verdict"] == row["verdict"]
+            cross_total += 1
+            if match:
+                cross_matches += 1
+            logger.info(
+                "Cross-judge result run_id=%s primary=%s secondary=%s match=%s",
+                row.get("run_id"),
+                row.get("verdict"),
+                second_result["verdict"],
+                match,
+            )
+            row["cross_judge_verdict"] = second_result["verdict"]
+            row["cross_judge_match"] = match
+            cross_rows.append(
+                {
+                    "run_id": row["run_id"],
+                    "primary_verdict": row["verdict"],
+                    "secondary_verdict": second_result["verdict"],
+                    "match": match,
+                    "secondary_raw_output": second_raw,
+                }
+            )
+    elif max_workers > 1 and cross_targets_list:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(_cross_judge_record, row_idx): row_idx
@@ -492,7 +633,68 @@ def validate_judge_against_golden(config: AppConfig, provider: ModelProvider) ->
 
     rows: List[Optional[Dict]] = [None] * total
 
-    if max_workers > 1:
+    if config.use_batch and total > 0:
+        logger.info(
+            "Golden validation batch mode enabled: submitting requests=%d poll_interval=%d",
+            total,
+            config.batch_poll_interval,
+        )
+        batch_requests: List[BatchRequest] = []
+        idx_to_custom: Dict[int, str] = {}
+        for idx, item in enumerate(golden):
+            prompt = build_judge_prompt(
+                config=config,
+                directive_id=item["directive_id"],
+                user_probe=item["user_probe"],
+                assistant_response=item["assistant_response"],
+            )
+            custom_id = f"golden_validate-{idx}-{item['example_id']}"
+            idx_to_custom[idx] = custom_id
+            batch_requests.append(
+                {
+                    "custom_id": custom_id,
+                    "model": config.anthropic_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "seed": config.seed,
+                    "max_output_tokens": 600,
+                }
+            )
+
+        results = provider.complete_batch(
+            requests=batch_requests,
+            poll_interval=config.batch_poll_interval,
+        )
+        for idx, item in enumerate(golden):
+            completion = results[idx_to_custom[idx]]
+            result, raw = _judge_result_from_completion(
+                directive_id=item["directive_id"],
+                completion=completion,
+            )
+            expected = item["expected_verdict"]
+            match = result["verdict"] == expected
+            row = {
+                "example_id": item["example_id"],
+                "directive_id": item["directive_id"],
+                "expected_verdict": expected,
+                "predicted_verdict": result["verdict"],
+                "confidence": result["confidence"],
+                "rationale": result["rationale"],
+                "match": match,
+                "judge_raw_output": raw,
+            }
+            rows[idx] = row
+            logger.info(
+                "Golden validation (%d/%d) example_id=%s expected=%s predicted=%s match=%s confidence=%.2f",
+                idx + 1,
+                total,
+                row["example_id"],
+                row["expected_verdict"],
+                row["predicted_verdict"],
+                row["match"],
+                float(result["confidence"]),
+            )
+    elif max_workers > 1:
         completed = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {

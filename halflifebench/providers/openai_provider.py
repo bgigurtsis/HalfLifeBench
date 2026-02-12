@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import tempfile
 import time
-from typing import List
+from pathlib import Path
+from typing import Any, Dict, List
 
 from openai import OpenAI
 
-from .base import CompletionResult, Message
+from .base import BatchRequest, CompletionResult, Message
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,206 @@ class OpenAIProvider:
         self._use_responses_api_by_model: dict[str, bool] = {}
         self._responses_param_support_by_model: dict[str, dict[str, bool]] = {}
         self._chat_param_support_by_model: dict[str, dict[str, bool]] = {}
+
+    @staticmethod
+    def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _to_chat_messages(messages: List[Message]) -> List[dict[str, str]]:
+        chat_messages: List[dict[str, str]] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "developer":
+                role = "system"
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+            chat_messages.append({"role": role, "content": content})
+        return chat_messages
+
+    @staticmethod
+    def _normalize_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        text_parts.append(str(item.get("text", "")))
+                    else:
+                        text_parts.append(str(item))
+                else:
+                    text_parts.append(str(item))
+            return "".join(text_parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def complete_batch(
+        self,
+        *,
+        requests: List[BatchRequest],
+        poll_interval: int = 60,
+    ) -> Dict[str, CompletionResult]:
+        if not requests:
+            return {}
+
+        safe_poll_interval = max(1, int(poll_interval))
+        expected_ids: set[str] = set()
+        expected_models: Dict[str, str] = {}
+        with tempfile.TemporaryDirectory(prefix="hlb_openai_batch_") as temp_dir:
+            batch_path = Path(temp_dir) / "requests.jsonl"
+            with batch_path.open("w", encoding="utf-8") as handle:
+                for req in requests:
+                    custom_id = str(req.get("custom_id", "")).strip()
+                    model = str(req.get("model", "")).strip()
+                    messages = req.get("messages")
+                    if not custom_id:
+                        raise ValueError("OpenAI batch request missing custom_id")
+                    if custom_id in expected_ids:
+                        raise ValueError(f"Duplicate OpenAI batch custom_id: {custom_id}")
+                    if not model:
+                        raise ValueError(f"OpenAI batch request {custom_id} missing model")
+                    if not isinstance(messages, list):
+                        raise ValueError(f"OpenAI batch request {custom_id} missing messages list")
+                    expected_ids.add(custom_id)
+                    expected_models[custom_id] = model
+
+                    body: Dict[str, Any] = {
+                        "model": model,
+                        "messages": self._to_chat_messages(messages),
+                        "max_tokens": int(req.get("max_output_tokens", 700)),
+                    }
+                    if "temperature" in req and req.get("temperature") is not None:
+                        body["temperature"] = float(req.get("temperature"))
+                    seed = req.get("seed")
+                    if seed is not None:
+                        body["seed"] = int(seed)
+
+                    handle.write(
+                        json.dumps(
+                            {
+                                "custom_id": custom_id,
+                                "method": "POST",
+                                "url": "/v1/chat/completions",
+                                "body": body,
+                            }
+                        )
+                        + "\n"
+                    )
+
+            with batch_path.open("rb") as file_handle:
+                uploaded = self.client.files.create(file=file_handle, purpose="batch")
+            input_file_id = self._obj_get(uploaded, "id")
+            logger.info("OpenAI batch input uploaded file_id=%s requests=%d", input_file_id, len(requests))
+
+            batch = self.client.batches.create(
+                input_file_id=input_file_id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+            )
+            batch_id = self._obj_get(batch, "id")
+            logger.info("OpenAI batch submitted batch_id=%s", batch_id)
+
+            terminal_failure = {"failed", "expired", "cancelled", "canceled"}
+            while True:
+                batch = self.client.batches.retrieve(batch_id)
+                status = str(self._obj_get(batch, "status", "unknown"))
+                request_counts = self._obj_get(batch, "request_counts", {})
+                logger.info(
+                    "OpenAI batch poll batch_id=%s status=%s counts=%s",
+                    batch_id,
+                    status,
+                    request_counts,
+                )
+                if status == "completed":
+                    break
+                if status in terminal_failure:
+                    raise RuntimeError(f"OpenAI batch {batch_id} ended with status={status}")
+                time.sleep(safe_poll_interval)
+
+            output_file_id = self._obj_get(batch, "output_file_id")
+            if not output_file_id:
+                raise RuntimeError(f"OpenAI batch {batch_id} completed without output_file_id")
+
+            content_response = self.client.files.content(output_file_id)
+            content_payload = self._obj_get(content_response, "content", content_response)
+            if isinstance(content_payload, (bytes, bytearray)):
+                lines = content_payload.decode("utf-8").splitlines()
+            else:
+                lines = str(content_payload).splitlines()
+
+        results: Dict[str, CompletionResult] = {}
+        errors: Dict[str, Any] = {}
+        for line in lines:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            custom_id = str(row.get("custom_id", "")).strip()
+            if not custom_id:
+                continue
+
+            response_obj = row.get("response")
+            error_obj = row.get("error")
+            if error_obj is not None:
+                errors[custom_id] = error_obj
+                continue
+            if not isinstance(response_obj, dict):
+                errors[custom_id] = {"error": "missing response object", "row": row}
+                continue
+
+            status_code = int(response_obj.get("status_code", 0) or 0)
+            body = response_obj.get("body", {})
+            if status_code and status_code >= 400:
+                errors[custom_id] = {"status_code": status_code, "body": body}
+                continue
+            if not isinstance(body, dict):
+                errors[custom_id] = {"error": "missing response body", "status_code": status_code}
+                continue
+
+            choices = body.get("choices", [])
+            if not choices:
+                errors[custom_id] = {"error": "missing choices", "status_code": status_code, "body": body}
+                continue
+            first_choice = choices[0]
+            message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+            content = self._normalize_content(message.get("content"))
+            usage = body.get("usage", {}) if isinstance(body.get("usage"), dict) else {}
+            input_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+            output_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+            model_name = str(body.get("model") or "")
+            metadata = {
+                "id": body.get("id"),
+                "batch_status_code": status_code,
+                "finish_reason": first_choice.get("finish_reason") if isinstance(first_choice, dict) else None,
+                "request_id": response_obj.get("request_id"),
+                "usage": usage,
+            }
+            results[custom_id] = CompletionResult(
+                content=content,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=model_name or expected_models.get(custom_id, ""),
+                metadata=metadata,
+            )
+
+        missing = sorted(expected_ids - set(results.keys()))
+        if missing or errors:
+            if errors:
+                for custom_id, error_payload in errors.items():
+                    logger.error("OpenAI batch item failed custom_id=%s error=%s", custom_id, error_payload)
+            if missing:
+                logger.error("OpenAI batch missing results for custom_ids=%s", missing)
+            raise RuntimeError(
+                f"OpenAI batch completed with failures: succeeded={len(results)} errors={len(errors)} missing={len(missing)}"
+            )
+
+        logger.info("OpenAI batch complete results=%d", len(results))
+        return results
 
     def complete(
         self,

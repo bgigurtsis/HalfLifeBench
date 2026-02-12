@@ -387,6 +387,16 @@ def score_results(config: AppConfig) -> Dict:
         "generated_at": _now_iso(),
         "model_under_test": config.openai_model,
         "judge_model": config.anthropic_model,
+        "run_config": {
+            "repetitions": config.repetitions,
+            "depth_targets": config.depth_targets,
+            "max_output_tokens": config.max_output_tokens,
+            "reasoning_effort": config.reasoning_effort,
+            "max_workers": config.max_workers,
+            "use_batch": config.use_batch,
+            "seed": config.seed,
+            "temperature": config.temperature,
+        },
         "scoring_policy": {
             "empty_outcome_tracked_separately": True,
             "pass_rate_basis": "all_responses_with_non_empty_breakout",

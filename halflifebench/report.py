@@ -268,17 +268,39 @@ def generate_report(config: AppConfig) -> Path:
     labels_json = json.dumps(directive_labels)
     baseline_row_count = sum(1 for d in directive_ids if d in scores.get("baseline_system", {}))
     sweep_row_count = sum(len(scores.get("sweep_grid", {}).get(d, [])) for d in directive_ids)
-    refresh_dataset_count = sum(
-        len(scores.get("near_probe_refresh", {}).get(gap, {}).get(d, []))
-        for gap in scores.get("near_probe_refresh", {})
-        for d in directive_ids
-    )
     logger.debug(
-        "Report table/chart counts baseline_rows=%d sweep_rows=%d refresh_series_points=%d",
+        "Report table/chart counts baseline_rows=%d sweep_rows=%d",
         baseline_row_count,
         sweep_row_count,
-        refresh_dataset_count,
     )
+
+    # Run configuration and summary metrics
+    run_config = scores.get("run_config", {})
+    record_counts = scores.get("record_counts", {})
+    total_records = sum(record_counts.values())
+    sweep_record_count = record_counts.get("sweep", 0)
+
+    _sweep_passes = 0
+    _sweep_total = 0
+    for _d_cells in scores.get("sweep_grid", {}).values():
+        for _cell in _d_cells:
+            _c = int(_cell.get("count", 0))
+            _sweep_total += _c
+            _sweep_passes += round(float(_cell.get("pass_rate", 0)) * _c)
+    overall_sweep_pass_rate = _sweep_passes / _sweep_total if _sweep_total > 0 else 0.0
+
+    _all_depths: set[int] = set()
+    for _d_cells in scores.get("sweep_grid", {}).values():
+        for _cell in _d_cells:
+            _all_depths.add(int(_cell.get("depth_target_tokens", 0)))
+    depth_count = len(_all_depths)
+    depth_max = max(_all_depths) if _all_depths else 0
+
+    half_life_data = scores.get("half_life", {})
+    decay_detected_count = sum(
+        1 for hl in half_life_data.values() if hl.get("fit_status") == "ok"
+    )
+    total_directives_fitted = len(half_life_data)
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -304,10 +326,23 @@ def generate_report(config: AppConfig) -> Path:
   <div class="meta">
     Generated: {_now_iso()} |
     Model-under-test: {scores.get("model_under_test")} |
-    Judge: {scores.get("judge_model")}
+    Judge: {scores.get("judge_model")} |
+    Repetitions/cell: {run_config.get("repetitions", "n/a")} |
+    Depth checkpoints: {depth_count} |
+    Reasoning effort: {run_config.get("reasoning_effort", "n/a")}
   </div>
   {exclusion_note}
   {warning_block}
+
+  <h2>Summary</h2>
+  <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+    <div class="card" style="text-align:center;"><strong>{total_records:,}</strong><br>Total records</div>
+    <div class="card" style="text-align:center;"><strong>{sweep_record_count:,}</strong><br>Sweep records</div>
+    <div class="card" style="text-align:center;"><strong>{overall_sweep_pass_rate:.1%}</strong><br>Sweep pass rate (all)</div>
+    <div class="card" style="text-align:center;"><strong>{depth_max:,}</strong><br>Max depth (tokens)</div>
+    <div class="card" style="text-align:center;"><strong>{depth_count}</strong><br>Depth checkpoints</div>
+    <div class="card" style="text-align:center;"><strong>{decay_detected_count} / {total_directives_fitted}</strong><br>Significant decay detected</div>
+  </div>
 
   <h2>Baselines</h2>
   <table>
@@ -338,11 +373,6 @@ def generate_report(config: AppConfig) -> Path:
     <div class="card">
       <h2>Empty Response Rate by Depth</h2>
       <canvas id="emptyRateChart"></canvas>
-    </div>
-    <div class="card">
-      <h2>Near-probe policy refresh (PoC)</h2>
-      <div>Single policy refresh inserted before probe. This is not periodic reinjection.</div>
-      <canvas id="refreshChart"></canvas>
     </div>
   </div>
 
@@ -502,34 +532,6 @@ def generate_report(config: AppConfig) -> Path:
       }}
     }});
 
-    const refreshDatasets = [];
-    const refresh = SCORES.near_probe_refresh || {{}};
-    Object.keys(refresh).forEach((gap) => {{
-      directives.forEach((d) => {{
-        const pts = (refresh[gap][d] || []).map((x) => ({{x: x.depth_tokens_measured_mean, y: x.pass_rate}}));
-        if (pts.length > 0) {{
-          refreshDatasets.push({{
-            label: d + " - " + (labels[d] || d) + " gap=" + gap,
-            data: pts,
-            parsing: false,
-            borderColor: colors[d],
-            backgroundColor: colors[d],
-            borderDash: [4, 4],
-            tension: 0.2
-          }});
-        }}
-      }});
-    }});
-    new Chart(document.getElementById("refreshChart"), {{
-      type: "line",
-      data: {{ datasets: refreshDatasets }},
-      options: {{
-        scales: {{
-          x: {{ type: "linear", title: {{ display: true, text: "depth_tokens_measured" }} }},
-          y: {{ min: 0, max: 1, title: {{ display: true, text: "pass rate" }} }}
-        }}
-      }}
-    }});
   </script>
 </body>
 </html>

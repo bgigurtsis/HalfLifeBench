@@ -6,6 +6,13 @@ from pathlib import Path
 from typing import List
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
 @dataclass
 class AppConfig:
     root_dir: Path
@@ -20,9 +27,25 @@ class AppConfig:
     max_output_tokens: int = 16000
     reasoning_effort: str = "medium"
     max_empty_retries: int = 2
-    repetitions: int = 10
+    repetitions: int = 20
+    use_batch: bool = False
+    batch_poll_interval: int = 60
     depth_targets: List[int] = field(
-        default_factory=lambda: [0, 8000, 32000, 50000, 64000, 80000, 100000, 128000, 200000, 256000]
+        default_factory=lambda: [
+            0,
+            4000,
+            8000,
+            16000,
+            32000,
+            48000,
+            50000,
+            64000,
+            80000,
+            100000,
+            128000,
+            200000,
+            256000,
+        ]
     )
     low_confidence_threshold: float = 0.7
     validate_judge_threshold: float = 0.8
@@ -51,6 +74,8 @@ def load_config(root_dir: Path | None = None) -> AppConfig:
         max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "16000")),
         reasoning_effort=os.getenv("REASONING_EFFORT", "medium"),
         max_empty_retries=int(os.getenv("MAX_EMPTY_RETRIES", "2")),
-        repetitions=int(os.getenv("REPETITIONS", "10")),
+        repetitions=int(os.getenv("REPETITIONS", "20")),
+        use_batch=_env_truthy("USE_BATCH", False),
+        batch_poll_interval=int(os.getenv("BATCH_POLL_INTERVAL", "60")),
         max_workers=int(os.getenv("MAX_WORKERS", "15")),
     )

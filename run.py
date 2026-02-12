@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 def _load_config_with_overrides(
     workers_override: int | None = None,
     repetitions_override: int | None = None,
+    batch_override: bool | None = None,
 ):
     """Load config and apply top-level CLI overrides if provided."""
     config = load_config(Path.cwd())
@@ -29,6 +30,8 @@ def _load_config_with_overrides(
         config.max_workers = workers_override
     if repetitions_override is not None:
         config.repetitions = repetitions_override
+    if batch_override is not None:
+        config.use_batch = batch_override
     return config
 
 
@@ -41,14 +44,14 @@ def _configure_noisy_loggers(verbose: bool) -> None:
     logging.getLogger("openai").setLevel(logging.INFO if verbose else logging.WARNING)
 
 def cmd_generate_filler(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     generate_filler_files(config)
     logger.info("Generated filler files.")
     return 0
 
 
 def cmd_validate_judge(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     provider = AnthropicProvider()
     result = validate_judge_against_golden(config, provider)
     overall = float(result["overall_agreement"])
@@ -62,7 +65,7 @@ def cmd_validate_judge(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     provider = OpenAIProvider()
 
     if not (args.baselines or args.sweep):
@@ -70,9 +73,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     logger.info(
-        "Using max_workers=%d repetitions=%d for benchmark calls",
+        "Using max_workers=%d repetitions=%d use_batch=%s for benchmark calls",
         config.max_workers,
         config.repetitions,
+        config.use_batch,
     )
 
     if args.baselines:
@@ -87,7 +91,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_judge(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     provider = AnthropicProvider()
     summary = run_judging(config, provider)
     logger.info(
@@ -99,7 +103,7 @@ def cmd_judge(args: argparse.Namespace) -> int:
 
 
 def cmd_compare_judges(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     if args.include_sweep < 0:
         logger.error("--include-sweep must be >= 0")
         return 1
@@ -125,7 +129,7 @@ def cmd_compare_judges(args: argparse.Namespace) -> int:
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     score_results(config)
     report_path = generate_report(config)
     logger.info("Report generated: %s", report_path)
@@ -133,14 +137,15 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_all(args: argparse.Namespace) -> int:
-    config = _load_config_with_overrides(args.workers, args.repetitions)
+    config = _load_config_with_overrides(args.workers, args.repetitions, args.batch)
     logger.info("Step 1/6: generate-filler")
     generate_filler_files(config)
 
     logger.info(
-        "Using max_workers=%d repetitions=%d for benchmark calls",
+        "Using max_workers=%d repetitions=%d use_batch=%s for benchmark calls",
         config.max_workers,
         config.repetitions,
+        config.use_batch,
     )
 
     logger.info("Step 2/6: validate-judge")
@@ -186,7 +191,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--repetitions",
         type=int,
         default=None,
-        help="Repetitions per (directive, depth) cell (default: 10, or REPETITIONS env var).",
+        help="Repetitions per (directive, depth) cell (default: 20, or REPETITIONS env var).",
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        default=None,
+        help="Use Batch API mode (50%% cheaper, async up to 24h). Default from USE_BATCH env.",
+    )
+    parser.add_argument(
+        "--no-batch",
+        dest="batch",
+        action="store_false",
+        help="Disable Batch API mode and use real-time API calls.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
