@@ -8,3 +8,5 @@ results/*
 !results/judge_summary.json
 !results/baselines.json
 data/filler/
+AGENTS.md
+.cursor/
