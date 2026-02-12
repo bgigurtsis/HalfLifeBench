@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-02-12T02:15:29.057239+00:00",
+  "total_records": 480,
+  "auto_fail_candidates": 17,
+  "auto_fail_audited": 3,
+  "precheck_accuracy": 1.0,
+  "disable_rule_based_shortcut_next_run": false,
+  "cross_judge_total": 93,
+  "cross_judge_agreement": 1.0
+}

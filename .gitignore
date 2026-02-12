@@ -2,7 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
-results/
+results/*
 !results/report.html
 !results/scores.json
 !results/judge_summary.json
