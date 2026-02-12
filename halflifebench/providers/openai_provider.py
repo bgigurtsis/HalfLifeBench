@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from .base import BatchRequest, CompletionResult, Message
 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class OpenAIProvider:
     def __init__(self) -> None:
-        self.client = OpenAI(timeout=60.0, max_retries=2)
+        self.client = OpenAI(timeout=120.0, max_retries=10)
         self._lock = threading.Lock()
         self._use_responses_api_by_model: dict[str, bool] = {}
         self._responses_param_support_by_model: dict[str, dict[str, bool]] = {}
@@ -444,6 +444,8 @@ class OpenAIProvider:
                 model=model,
                 metadata=metadata,
             )
+        except RateLimitError:
+            raise
         except Exception as responses_exc:
             with self._lock:
                 self._use_responses_api_by_model[model] = False

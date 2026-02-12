@@ -241,6 +241,10 @@ def generate_filler_messages(target_tokens: int, model: str, seed: int) -> Tuple
 def generate_filler_files(config: AppConfig) -> None:
     ensure_dir(config.filler_dir)
     for depth_target in config.depth_targets:
+        out_path = config.filler_dir / f"depth_{depth_target}.json"
+        if out_path.exists():
+            logger.info("Skipping filler generation for depth_target=%d (already exists: %s)", depth_target, out_path)
+            continue
         logger.info("Generating filler for depth_target=%d", depth_target)
         messages, estimated_tokens = generate_filler_messages(depth_target, config.openai_model, config.seed)
         logger.info(
@@ -266,7 +270,6 @@ def generate_filler_files(config: AppConfig) -> None:
             "messages": messages,
             "validation": {"is_valid": validation.is_valid, "reason": validation.reason},
         }
-        out_path = config.filler_dir / f"depth_{depth_target}.json"
         write_json(out_path, payload)
         logger.info("Wrote filler file: %s", out_path)
 

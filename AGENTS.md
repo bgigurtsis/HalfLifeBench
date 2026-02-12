@@ -76,6 +76,13 @@ run.py                   CLI entry point (argparse subcommands)
 6. **Filler validation** must cover all 10 directives via keyword blacklist,
    not just secrets/PII.
 
+## Git Workflow Preference
+
+- After every code or documentation change, the agent should create a git
+  commit and push it to the current remote branch.
+- Keep git safety defaults: no force push and no history rewrites unless
+  explicitly requested.
+
 ## Environment
 
 - Python 3.11+
@@ -124,6 +131,45 @@ exactly. When the report and the implemented code diverge, the code is
 authoritative.
 
 ## Recent Implementation Notes
+
+### 2026-02-12 -- Add persistent auto commit/push workflow instruction
+
+- Added a project-level agent workflow preference to commit and push after each
+  change.
+- Applied the instruction in both rule sources so it is consistently picked up
+  by future sessions.
+- Files touched: `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: future agent runs will default to committing and pushing after
+  each change unless explicitly directed otherwise.
+
+### 2026-02-12 -- Add crash-safe incremental persistence and resume across pipeline stages
+
+- Implemented append-on-complete + skip-on-resume for all API-heavy stages:
+  - `run_baselines(...)` now resumes from existing
+    `results/raw/baseline_system.jsonl` and
+    `results/raw/baseline_no_system.jsonl`, writes each completed record
+    immediately, and avoids re-calling completed run IDs.
+  - `run_sweep(...)` now resumes from `results/raw/sweep.jsonl`, filters out
+    completed run IDs before submission, and appends each completed row
+    immediately instead of writing only at the end.
+  - `run_judging(...)` now resumes from `results/judged.jsonl`, appends each
+    newly judged row immediately, and resumes cross-judge spot checks using
+    `results/cross_judge_results.jsonl` as an incremental checkpoint.
+  - `validate_judge_against_golden(...)` now resumes by `example_id` from
+    existing `results/validate_judge.json` and incremental
+    `results/validate_judge_partial.jsonl`, appending each new validation row.
+- Added thread-safe JSONL appends for parallel workers:
+  - new `append_jsonl_threadsafe(...)` in `halflifebench/utils.py` uses a
+    process-level lock to prevent concurrent write races on Windows.
+- Added idempotent filler generation:
+  - `generate_filler_files(...)` now skips depth files that already exist,
+    avoiding unnecessary regeneration work.
+- Files touched: `halflifebench/runner.py`, `halflifebench/judge.py`,
+  `halflifebench/filler.py`, `halflifebench/utils.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: interrupted runs can be resumed without re-spending completed
+  API calls for baselines/sweep/judging/golden validation; long runs now
+  persist progress continuously instead of only at stage end.
 
 ### 2026-02-12 -- Report cleanup: remove dead refresh section, add summary and run config metadata
 
@@ -530,6 +576,30 @@ authoritative.
 - Added provider API diagnostics and fallback warnings in:
   - `halflifebench/providers/openai_provider.py`
   - `halflifebench/providers/anthropic_provider.py`
+
+### 2026-02-12 -- Fix OpenAI 429 rate-limit crash at high context depths
+
+- Root cause: at depth=256000 each request uses ~200k tokens; with 5 parallel
+  workers the 20M TPM limit is easily exceeded. The OpenAI SDK client had
+  `max_retries=2` (3 total attempts), which wasn't enough exponential backoff
+  time for the per-minute window to recover.
+- Increased SDK `max_retries` from `2` to `10` in `OpenAIProvider.__init__`.
+  With exponential backoff capped at 8s per retry, this provides up to ~55s of
+  total backoff per API call, enough for the TPM window to roll.
+- Increased client `timeout` from `60s` to `120s` to accommodate the larger
+  payloads at high context depths.
+- Added explicit `except RateLimitError: raise` before the generic
+  `except Exception` that triggers the Chat Completions fallback. Previously,
+  a rate-limit error on the Responses API was caught by the generic handler,
+  which disabled the Responses API for that model and fell through to Chat
+  Completions (which would also be rate-limited). Now rate-limit errors
+  propagate cleanly without triggering the API-compatibility fallback.
+- Imported `RateLimitError` from `openai`.
+- Files touched: `halflifebench/providers/openai_provider.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: high-depth sweeps (128k-256k) with multiple workers are
+  much more resilient to TPM rate limits; eliminates the crash-on-429 failure
+  mode that previously required manual restart.
 
 ## Required Post-Change Documentation Sync
 

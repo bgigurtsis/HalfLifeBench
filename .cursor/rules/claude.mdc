@@ -43,6 +43,10 @@ run.py                 # CLI entry point
 - Judge verdicts are PASS/FAIL JSON with CoT. Parse the last JSON block from output.
 - Default to FAIL on any ambiguity (judge parse failure, low confidence, etc.).
 - Filler validation must cover all 10 directives (keyword blacklist), not just secrets.
+- After every code or documentation change, create a git commit and push to the
+  current remote branch by default.
+- Keep git safety defaults: no force push and no history rewrites unless
+  explicitly requested.
 
 ## Reference
 
@@ -57,6 +61,43 @@ not always match the current implementation exactly -- always prefer the plan
 and code when they diverge.
 
 ## Recent Implementation Notes
+
+### 2026-02-12 -- Add persistent auto commit/push workflow instruction
+
+- Added a persistent agent workflow rule to commit and push after each
+  code/documentation change.
+- Mirrored the instruction in both `AGENTS.md` and `.cursor/rules/claude.mdc`
+  to keep behavior consistent across sessions.
+- Files touched: `AGENTS.md`, `.cursor/rules/claude.mdc`.
+- User-visible: agent defaults now include commit + push after each change
+  unless explicitly overridden.
+
+### 2026-02-12 -- Add crash-safe incremental persistence and resume across pipeline stages
+
+- Implemented append-on-complete + skip-on-resume across API-heavy stages:
+  - `run_baselines(...)` now resumes from existing
+    `results/raw/baseline_system.jsonl` and
+    `results/raw/baseline_no_system.jsonl`, and appends each new result
+    immediately.
+  - `run_sweep(...)` now resumes from `results/raw/sweep.jsonl`, skips
+    completed run IDs at submission time, and appends each completed row.
+  - `run_judging(...)` now resumes from `results/judged.jsonl`, appends
+    judgments incrementally, and resumes cross-judge spot checks via
+    `results/cross_judge_results.jsonl`.
+  - `validate_judge_against_golden(...)` now resumes by `example_id` using
+    existing `results/validate_judge.json` plus incremental
+    `results/validate_judge_partial.jsonl`.
+- Added thread-safe JSONL append helper in `halflifebench/utils.py`:
+  - new `append_jsonl_threadsafe(...)` wraps append writes with a lock to
+    avoid parallel write races (especially on Windows).
+- Added filler idempotency:
+  - `generate_filler_files(...)` now skips `depth_{N}.json` files that already
+    exist.
+- Files touched: `halflifebench/runner.py`, `halflifebench/judge.py`,
+  `halflifebench/filler.py`, `halflifebench/utils.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: interrupted benchmark/judging runs now resume without redoing
+  already completed API calls; progress is saved continuously during execution.
 
 ### 2026-02-12 -- Report cleanup: remove dead refresh section, add summary and run config metadata
 
@@ -427,6 +468,19 @@ and code when they diverge.
 - Added provider-level debug/warning logs in:
   - `halflifebench/providers/openai_provider.py`
   - `halflifebench/providers/anthropic_provider.py`
+
+### 2026-02-12 -- Fix OpenAI 429 rate-limit crash at high context depths
+
+- Increased SDK `max_retries` from `2` to `10` (exponential backoff up to ~55s
+  total per API call) and `timeout` from `60s` to `120s`.
+- Added explicit `except RateLimitError: raise` before the generic `except
+  Exception` that triggers the Responses→Chat Completions fallback, so rate
+  limits don't get misinterpreted as API incompatibility.
+- Imported `RateLimitError` from `openai`.
+- Files touched: `halflifebench/providers/openai_provider.py`, `AGENTS.md`,
+  `.cursor/rules/claude.mdc`.
+- User-visible: high-depth sweeps with parallel workers are resilient to 429
+  TPM rate limits instead of crashing.
 
 ## Documentation Sync Rule (Mandatory)
 

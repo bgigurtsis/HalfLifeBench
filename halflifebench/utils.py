@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -42,6 +43,15 @@ def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
     ensure_dir(path.parent)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+_jsonl_append_lock = threading.Lock()
+
+
+def append_jsonl_threadsafe(path: Path, row: Dict[str, Any]) -> None:
+    # Multiple ThreadPoolExecutor workers may append concurrently.
+    with _jsonl_append_lock:
+        append_jsonl(path, row)
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:

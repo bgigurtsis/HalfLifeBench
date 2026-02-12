@@ -10,12 +10,13 @@ from .config import AppConfig
 from .filler import load_filler_messages
 from .providers.base import BatchRequest, CompletionResult, Message, ModelProvider
 from .utils import (
+    append_jsonl_threadsafe,
     estimate_messages_tokens,
     estimate_text_tokens,
     read_json,
+    read_jsonl,
     read_text,
     write_json,
-    write_jsonl,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,12 @@ def _build_record_from_completion(
     )
 
     record = {
-        "run_id": f"{run_type}:{depth_target_tokens}:{probe['probe_id']}:r{repetition_index}",
+        "run_id": _build_run_id(
+            run_type=run_type,
+            depth_target_tokens=depth_target_tokens,
+            probe_id=str(probe["probe_id"]),
+            repetition_index=repetition_index,
+        ),
         "run_type": run_type,
         "timestamp": _now_iso(),
         "probe_id": probe["probe_id"],
@@ -150,6 +156,10 @@ def _build_record_from_completion(
         "metadata": completion.metadata,
     }
     return record, int(overhead_calibrated)
+
+
+def _build_run_id(*, run_type: str, depth_target_tokens: int, probe_id: str, repetition_index: int) -> str:
+    return f"{run_type}:{depth_target_tokens}:{probe_id}:r{repetition_index}"
 
 
 def _single_call_record(
@@ -233,197 +243,274 @@ def run_baselines(config: AppConfig, provider: ModelProvider) -> None:
     if not baseline_tasks:
         raise ValueError("No baseline tasks generated from probes.")
 
-    system_prompt = _load_system_prompt(config)
     total = len(baseline_tasks)
     max_workers = max(1, config.max_workers)
+    system_prompt = _load_system_prompt(config)
+    raw_dir = config.results_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_system_path = raw_dir / "baseline_system.jsonl"
+    baseline_no_system_path = raw_dir / "baseline_no_system.jsonl"
+    calibration_path = config.results_dir / "calibration.json"
+    baselines_summary_path = config.results_dir / "baselines.json"
+
+    expected_system_run_ids = {
+        _build_run_id(
+            run_type="baseline_system",
+            depth_target_tokens=0,
+            probe_id=str(probe["probe_id"]),
+            repetition_index=rep_idx,
+        )
+        for _, probe, rep_idx, _ in baseline_tasks
+    }
+    expected_no_system_run_ids = {
+        _build_run_id(
+            run_type="baseline_no_system",
+            depth_target_tokens=0,
+            probe_id=str(probe["probe_id"]),
+            repetition_index=rep_idx,
+        )
+        for _, probe, rep_idx, _ in baseline_tasks
+    }
+
+    existing_system = read_jsonl(baseline_system_path)
+    existing_no_system = read_jsonl(baseline_no_system_path)
+    completed_system_ids = {
+        str(row.get("run_id"))
+        for row in existing_system
+        if str(row.get("run_id")) in expected_system_run_ids
+    }
+    completed_no_system_ids = {
+        str(row.get("run_id"))
+        for row in existing_no_system
+        if str(row.get("run_id")) in expected_no_system_run_ids
+    }
+
     logger.info(
-        "Starting baselines: directives=%d repetitions=%d total_calls_per_phase=%d max_workers=%d",
+        "Starting baselines: directives=%d repetitions=%d total_calls_per_phase=%d max_workers=%d use_batch=%s",
         len(directives),
         config.repetitions,
         total,
         max_workers,
+        config.use_batch,
+    )
+    logger.info(
+        "Resuming baselines: existing_system=%d existing_no_system=%d",
+        len(completed_system_ids),
+        len(completed_no_system_ids),
     )
 
-    raw_dir = config.results_dir / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    overhead_calibrated: Optional[int] = None
+    if calibration_path.exists():
+        payload = read_json(calibration_path)
+        overhead_calibrated = int(payload.get("overhead_calibrated", 0))
+        logger.info("Loaded calibrated overhead=%d from %s", overhead_calibrated, calibration_path)
+    else:
+        for row in existing_system:
+            run_id = str(row.get("run_id"))
+            if run_id not in completed_system_ids:
+                continue
+            if "overhead_calibrated" in row:
+                overhead_calibrated = int(row.get("overhead_calibrated", 0))
+                logger.info(
+                    "Recovered calibrated overhead=%d from existing baseline_system records",
+                    overhead_calibrated,
+                )
+                break
 
-    system_records: List[Optional[Dict]] = [None] * total
-    no_system_records: List[Optional[Dict]] = [None] * total
-
-    if config.use_batch:
-        logger.info(
-            "Baselines batch mode enabled: submitting phase requests via Batch API poll_interval=%d",
-            config.batch_poll_interval,
+    remaining_system: List[Tuple[int, Dict, int, int, str]] = []
+    for idx, probe, rep_idx, seed in baseline_tasks:
+        run_id = _build_run_id(
+            run_type="baseline_system",
+            depth_target_tokens=0,
+            probe_id=str(probe["probe_id"]),
+            repetition_index=rep_idx,
         )
+        if run_id in completed_system_ids:
+            continue
+        remaining_system.append((idx, probe, rep_idx, seed, run_id))
+    logger.info(
+        "Baseline system resume state: completed=%d remaining=%d total=%d",
+        total - len(remaining_system),
+        len(remaining_system),
+        total,
+    )
 
-        # -- Phase 1: baseline_system batch --------------------------------
-        system_task_meta: List[Dict] = []
-        system_batch_requests: List[BatchRequest] = []
-        for idx, probe, rep_idx, seed in baseline_tasks:
-            prefix, messages = _build_call_messages(
+    completed_system = total - len(remaining_system)
+    if config.use_batch:
+        if remaining_system:
+            system_task_meta: List[Dict] = []
+            system_batch_requests: List[BatchRequest] = []
+            for idx, probe, rep_idx, seed, run_id in remaining_system:
+                prefix, messages = _build_call_messages(
+                    system_prompt=system_prompt,
+                    filler_messages=[],
+                    include_system=True,
+                    probe=probe,
+                )
+                depth_tokens_planned = estimate_messages_tokens(prefix, config.openai_model)
+                probe_tokens_estimate = estimate_text_tokens(probe["user_message"], config.openai_model)
+                custom_id = f"baseline_system-{idx}-{probe['probe_id']}-r{rep_idx}"
+                system_task_meta.append(
+                    {
+                        "idx": idx,
+                        "run_id": run_id,
+                        "custom_id": custom_id,
+                        "probe": probe,
+                        "rep_idx": rep_idx,
+                        "seed": seed,
+                        "messages": messages,
+                        "depth_tokens_planned": depth_tokens_planned,
+                        "probe_tokens_estimate": probe_tokens_estimate,
+                    }
+                )
+                system_batch_requests.append(
+                    {
+                        "custom_id": custom_id,
+                        "model": config.openai_model,
+                        "messages": messages,
+                        "temperature": config.temperature,
+                        "seed": seed,
+                        "max_output_tokens": config.max_output_tokens,
+                        "reasoning_effort": config.reasoning_effort,
+                    }
+                )
+
+            logger.info(
+                "Baselines batch mode (system): submitting remaining requests=%d poll_interval=%d",
+                len(system_batch_requests),
+                config.batch_poll_interval,
+            )
+            system_results = provider.complete_batch(
+                requests=system_batch_requests,
+                poll_interval=config.batch_poll_interval,
+            )
+
+            if overhead_calibrated is None:
+                first_meta = system_task_meta[0]
+                first_completion = system_results[first_meta["custom_id"]]
+                first_record, overhead_calibrated = _build_record_from_completion(
+                    completion=first_completion,
+                    probe=first_meta["probe"],
+                    messages=first_meta["messages"],
+                    depth_target_tokens=0,
+                    run_type="baseline_system",
+                    overhead_calibrated=None,
+                    repetition_index=first_meta["rep_idx"],
+                    effective_seed=first_meta["seed"],
+                    depth_tokens_planned=first_meta["depth_tokens_planned"],
+                    probe_tokens_estimate=first_meta["probe_tokens_estimate"],
+                )
+                append_jsonl_threadsafe(baseline_system_path, first_record)
+                completed_system_ids.add(first_meta["run_id"])
+                completed_system += 1
+                if overhead_calibrated is None:
+                    overhead_calibrated = 0
+                write_json(calibration_path, {"overhead_calibrated": overhead_calibrated})
+                logger.info("Calibrated overhead=%d tokens", overhead_calibrated)
+                logger.info(
+                    "Baseline system: probe=%s rep=%d (%d/%d)",
+                    first_record.get("probe_id"),
+                    first_record.get("repetition_index"),
+                    completed_system,
+                    total,
+                )
+                remaining_meta = system_task_meta[1:]
+            else:
+                remaining_meta = system_task_meta
+
+            for meta in remaining_meta:
+                completion = system_results[meta["custom_id"]]
+                record, _ = _build_record_from_completion(
+                    completion=completion,
+                    probe=meta["probe"],
+                    messages=meta["messages"],
+                    depth_target_tokens=0,
+                    run_type="baseline_system",
+                    overhead_calibrated=overhead_calibrated,
+                    repetition_index=meta["rep_idx"],
+                    effective_seed=meta["seed"],
+                    depth_tokens_planned=meta["depth_tokens_planned"],
+                    probe_tokens_estimate=meta["probe_tokens_estimate"],
+                )
+                append_jsonl_threadsafe(baseline_system_path, record)
+                completed_system_ids.add(meta["run_id"])
+                completed_system += 1
+                logger.info(
+                    "Baseline system: probe=%s rep=%d (%d/%d)",
+                    record.get("probe_id"),
+                    record.get("repetition_index"),
+                    completed_system,
+                    total,
+                )
+    else:
+        if remaining_system and overhead_calibrated is None:
+            _, first_probe, first_rep_idx, first_seed, first_run_id = remaining_system[0]
+            logger.info(
+                "Baseline system: probe=%s rep=%d (%d/%d) -- calibrating overhead",
+                first_probe.get("probe_id"),
+                first_rep_idx,
+                completed_system + 1,
+                total,
+            )
+            first_record, overhead_calibrated = _single_call_record(
+                provider=provider,
+                config=config,
+                probe=first_probe,
                 system_prompt=system_prompt,
                 filler_messages=[],
                 include_system=True,
-                probe=probe,
-            )
-            depth_tokens_planned = estimate_messages_tokens(prefix, config.openai_model)
-            probe_tokens_estimate = estimate_text_tokens(probe["user_message"], config.openai_model)
-            custom_id = f"baseline_system-{idx}-{probe['probe_id']}-r{rep_idx}"
-            system_task_meta.append(
-                {
-                    "idx": idx,
-                    "custom_id": custom_id,
-                    "probe": probe,
-                    "rep_idx": rep_idx,
-                    "seed": seed,
-                    "messages": messages,
-                    "depth_tokens_planned": depth_tokens_planned,
-                    "probe_tokens_estimate": probe_tokens_estimate,
-                }
-            )
-            system_batch_requests.append(
-                {
-                    "custom_id": custom_id,
-                    "model": config.openai_model,
-                    "messages": messages,
-                    "temperature": config.temperature,
-                    "seed": seed,
-                    "max_output_tokens": config.max_output_tokens,
-                    "reasoning_effort": config.reasoning_effort,
-                }
-            )
-
-        system_results = provider.complete_batch(
-            requests=system_batch_requests,
-            poll_interval=config.batch_poll_interval,
-        )
-
-        first_meta = system_task_meta[0]
-        first_completion = system_results[first_meta["custom_id"]]
-        first_record, overhead_calibrated = _build_record_from_completion(
-            completion=first_completion,
-            probe=first_meta["probe"],
-            messages=first_meta["messages"],
-            depth_target_tokens=0,
-            run_type="baseline_system",
-            overhead_calibrated=None,
-            repetition_index=first_meta["rep_idx"],
-            effective_seed=first_meta["seed"],
-            depth_tokens_planned=first_meta["depth_tokens_planned"],
-            probe_tokens_estimate=first_meta["probe_tokens_estimate"],
-        )
-        system_records[first_meta["idx"]] = first_record
-        logger.info("Calibrated overhead=%d tokens", overhead_calibrated)
-
-        for meta in system_task_meta[1:]:
-            completion = system_results[meta["custom_id"]]
-            record, _ = _build_record_from_completion(
-                completion=completion,
-                probe=meta["probe"],
-                messages=meta["messages"],
                 depth_target_tokens=0,
                 run_type="baseline_system",
-                overhead_calibrated=overhead_calibrated,
-                repetition_index=meta["rep_idx"],
-                effective_seed=meta["seed"],
-                depth_tokens_planned=meta["depth_tokens_planned"],
-                probe_tokens_estimate=meta["probe_tokens_estimate"],
+                overhead_calibrated=None,
+                seed_override=first_seed,
+                repetition_index=first_rep_idx,
             )
-            system_records[meta["idx"]] = record
+            if overhead_calibrated is None:
+                overhead_calibrated = 0
+            append_jsonl_threadsafe(baseline_system_path, first_record)
+            completed_system_ids.add(first_run_id)
+            completed_system += 1
+            write_json(calibration_path, {"overhead_calibrated": overhead_calibrated})
+            logger.info("Calibrated overhead=%d tokens", overhead_calibrated)
+            remaining_system = remaining_system[1:]
 
-        # -- Phase 2: baseline_no_system batch -----------------------------
-        no_system_task_meta: List[Dict] = []
-        no_system_batch_requests: List[BatchRequest] = []
-        for idx, probe, rep_idx, seed in baseline_tasks:
-            prefix, messages = _build_call_messages(
-                system_prompt=system_prompt,
-                filler_messages=[],
-                include_system=False,
-                probe=probe,
-            )
-            depth_tokens_planned = estimate_messages_tokens(prefix, config.openai_model)
-            probe_tokens_estimate = estimate_text_tokens(probe["user_message"], config.openai_model)
-            custom_id = f"baseline_no_system-{idx}-{probe['probe_id']}-r{rep_idx}"
-            no_system_task_meta.append(
-                {
-                    "idx": idx,
-                    "custom_id": custom_id,
-                    "probe": probe,
-                    "rep_idx": rep_idx,
-                    "seed": seed,
-                    "messages": messages,
-                    "depth_tokens_planned": depth_tokens_planned,
-                    "probe_tokens_estimate": probe_tokens_estimate,
-                }
-            )
-            no_system_batch_requests.append(
-                {
-                    "custom_id": custom_id,
-                    "model": config.openai_model,
-                    "messages": messages,
-                    "temperature": config.temperature,
-                    "seed": seed,
-                    "max_output_tokens": config.max_output_tokens,
-                    "reasoning_effort": config.reasoning_effort,
-                }
-            )
-
-        no_system_results = provider.complete_batch(
-            requests=no_system_batch_requests,
-            poll_interval=config.batch_poll_interval,
-        )
-        for meta in no_system_task_meta:
-            completion = no_system_results[meta["custom_id"]]
-            record, _ = _build_record_from_completion(
-                completion=completion,
-                probe=meta["probe"],
-                messages=meta["messages"],
-                depth_target_tokens=0,
-                run_type="baseline_no_system",
-                overhead_calibrated=overhead_calibrated,
-                repetition_index=meta["rep_idx"],
-                effective_seed=meta["seed"],
-                depth_tokens_planned=meta["depth_tokens_planned"],
-                probe_tokens_estimate=meta["probe_tokens_estimate"],
-            )
-            no_system_records[meta["idx"]] = record
-    else:
-        # -- Phase 1: baseline_system ----------------------------------------
-        # First task runs sequentially to calibrate overhead.
-        _, first_probe, first_rep_idx, first_seed = baseline_tasks[0]
-        logger.info(
-            "Baseline system: probe=%s rep=%d (1/%d) -- calibrating overhead",
-            first_probe.get("probe_id"),
-            first_rep_idx,
-            total,
-        )
-        first_record, overhead_calibrated = _single_call_record(
-            provider=provider,
-            config=config,
-            probe=first_probe,
-            system_prompt=system_prompt,
-            filler_messages=[],
-            include_system=True,
-            depth_target_tokens=0,
-            run_type="baseline_system",
-            overhead_calibrated=None,
-            seed_override=first_seed,
-            repetition_index=first_rep_idx,
-        )
-        if overhead_calibrated is None:
-            overhead_calibrated = 0
-        logger.info("Calibrated overhead=%d tokens", overhead_calibrated)
-
-        # Remaining baseline_system calls run in parallel.
-        system_records[0] = first_record
-        remaining_system = baseline_tasks[1:]
-
-        if remaining_system and max_workers > 1:
-            completed = 1
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {
-                    executor.submit(
-                        _single_call_record,
+        if remaining_system:
+            if max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_task = {
+                        executor.submit(
+                            _single_call_record,
+                            provider=provider,
+                            config=config,
+                            probe=probe,
+                            system_prompt=system_prompt,
+                            filler_messages=[],
+                            include_system=True,
+                            depth_target_tokens=0,
+                            run_type="baseline_system",
+                            overhead_calibrated=overhead_calibrated,
+                            seed_override=seed,
+                            repetition_index=rep_idx,
+                        ): (run_id, probe, rep_idx)
+                        for _, probe, rep_idx, seed, run_id in remaining_system
+                    }
+                    for future in as_completed(future_to_task):
+                        run_id, _, _ = future_to_task[future]
+                        record, _ = future.result()
+                        append_jsonl_threadsafe(baseline_system_path, record)
+                        completed_system_ids.add(run_id)
+                        completed_system += 1
+                        logger.info(
+                            "Baseline system: probe=%s rep=%d (%d/%d)",
+                            record.get("probe_id"),
+                            record.get("repetition_index"),
+                            completed_system,
+                            total,
+                        )
+            else:
+                for _, probe, rep_idx, seed, run_id in remaining_system:
+                    record, _ = _single_call_record(
                         provider=provider,
                         config=config,
                         probe=probe,
@@ -435,46 +522,150 @@ def run_baselines(config: AppConfig, provider: ModelProvider) -> None:
                         overhead_calibrated=overhead_calibrated,
                         seed_override=seed,
                         repetition_index=rep_idx,
-                    ): idx
-                    for idx, probe, rep_idx, seed in remaining_system
-                }
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    record, _ = future.result()
-                    system_records[idx] = record
-                    completed += 1
+                    )
+                    append_jsonl_threadsafe(baseline_system_path, record)
+                    completed_system_ids.add(run_id)
+                    completed_system += 1
                     logger.info(
                         "Baseline system: probe=%s rep=%d (%d/%d)",
                         record.get("probe_id"),
                         record.get("repetition_index"),
-                        completed,
+                        completed_system,
                         total,
                     )
-        else:
-            for idx, probe, rep_idx, seed in remaining_system:
-                logger.info("Baseline system: probe=%s rep=%d (%d/%d)", probe.get("probe_id"), rep_idx, idx + 1, total)
-                record, _ = _single_call_record(
-                    provider=provider,
-                    config=config,
-                    probe=probe,
+
+    if overhead_calibrated is None:
+        overhead_calibrated = 0
+        logger.warning("No baseline system calls executed; using overhead_calibrated=0")
+    write_json(calibration_path, {"overhead_calibrated": overhead_calibrated})
+
+    remaining_no_system: List[Tuple[int, Dict, int, int, str]] = []
+    for idx, probe, rep_idx, seed in baseline_tasks:
+        run_id = _build_run_id(
+            run_type="baseline_no_system",
+            depth_target_tokens=0,
+            probe_id=str(probe["probe_id"]),
+            repetition_index=rep_idx,
+        )
+        if run_id in completed_no_system_ids:
+            continue
+        remaining_no_system.append((idx, probe, rep_idx, seed, run_id))
+    logger.info(
+        "Baseline no-system resume state: completed=%d remaining=%d total=%d",
+        total - len(remaining_no_system),
+        len(remaining_no_system),
+        total,
+    )
+
+    completed_no_system = total - len(remaining_no_system)
+    if config.use_batch:
+        if remaining_no_system:
+            no_system_task_meta: List[Dict] = []
+            no_system_batch_requests: List[BatchRequest] = []
+            for idx, probe, rep_idx, seed, run_id in remaining_no_system:
+                prefix, messages = _build_call_messages(
                     system_prompt=system_prompt,
                     filler_messages=[],
-                    include_system=True,
-                    depth_target_tokens=0,
-                    run_type="baseline_system",
-                    overhead_calibrated=overhead_calibrated,
-                    seed_override=seed,
-                    repetition_index=rep_idx,
+                    include_system=False,
+                    probe=probe,
                 )
-                system_records[idx] = record
+                depth_tokens_planned = estimate_messages_tokens(prefix, config.openai_model)
+                probe_tokens_estimate = estimate_text_tokens(probe["user_message"], config.openai_model)
+                custom_id = f"baseline_no_system-{idx}-{probe['probe_id']}-r{rep_idx}"
+                no_system_task_meta.append(
+                    {
+                        "run_id": run_id,
+                        "custom_id": custom_id,
+                        "probe": probe,
+                        "rep_idx": rep_idx,
+                        "seed": seed,
+                        "messages": messages,
+                        "depth_tokens_planned": depth_tokens_planned,
+                        "probe_tokens_estimate": probe_tokens_estimate,
+                    }
+                )
+                no_system_batch_requests.append(
+                    {
+                        "custom_id": custom_id,
+                        "model": config.openai_model,
+                        "messages": messages,
+                        "temperature": config.temperature,
+                        "seed": seed,
+                        "max_output_tokens": config.max_output_tokens,
+                        "reasoning_effort": config.reasoning_effort,
+                    }
+                )
 
-        # -- Phase 2: baseline_no_system -------------------------------------
-        if max_workers > 1:
-            completed = 0
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {
-                    executor.submit(
-                        _single_call_record,
+            logger.info(
+                "Baselines batch mode (no-system): submitting remaining requests=%d poll_interval=%d",
+                len(no_system_batch_requests),
+                config.batch_poll_interval,
+            )
+            no_system_results = provider.complete_batch(
+                requests=no_system_batch_requests,
+                poll_interval=config.batch_poll_interval,
+            )
+            for meta in no_system_task_meta:
+                completion = no_system_results[meta["custom_id"]]
+                record, _ = _build_record_from_completion(
+                    completion=completion,
+                    probe=meta["probe"],
+                    messages=meta["messages"],
+                    depth_target_tokens=0,
+                    run_type="baseline_no_system",
+                    overhead_calibrated=overhead_calibrated,
+                    repetition_index=meta["rep_idx"],
+                    effective_seed=meta["seed"],
+                    depth_tokens_planned=meta["depth_tokens_planned"],
+                    probe_tokens_estimate=meta["probe_tokens_estimate"],
+                )
+                append_jsonl_threadsafe(baseline_no_system_path, record)
+                completed_no_system_ids.add(meta["run_id"])
+                completed_no_system += 1
+                logger.info(
+                    "Baseline no-system: probe=%s rep=%d (%d/%d)",
+                    record.get("probe_id"),
+                    record.get("repetition_index"),
+                    completed_no_system,
+                    total,
+                )
+    else:
+        if remaining_no_system:
+            if max_workers > 1:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_task = {
+                        executor.submit(
+                            _single_call_record,
+                            provider=provider,
+                            config=config,
+                            probe=probe,
+                            system_prompt=system_prompt,
+                            filler_messages=[],
+                            include_system=False,
+                            depth_target_tokens=0,
+                            run_type="baseline_no_system",
+                            overhead_calibrated=overhead_calibrated,
+                            seed_override=seed,
+                            repetition_index=rep_idx,
+                        ): (run_id, probe, rep_idx)
+                        for _, probe, rep_idx, seed, run_id in remaining_no_system
+                    }
+                    for future in as_completed(future_to_task):
+                        run_id, _, _ = future_to_task[future]
+                        record, _ = future.result()
+                        append_jsonl_threadsafe(baseline_no_system_path, record)
+                        completed_no_system_ids.add(run_id)
+                        completed_no_system += 1
+                        logger.info(
+                            "Baseline no-system: probe=%s rep=%d (%d/%d)",
+                            record.get("probe_id"),
+                            record.get("repetition_index"),
+                            completed_no_system,
+                            total,
+                        )
+            else:
+                for _, probe, rep_idx, seed, run_id in remaining_no_system:
+                    record, _ = _single_call_record(
                         provider=provider,
                         config=config,
                         probe=probe,
@@ -486,60 +677,37 @@ def run_baselines(config: AppConfig, provider: ModelProvider) -> None:
                         overhead_calibrated=overhead_calibrated,
                         seed_override=seed,
                         repetition_index=rep_idx,
-                    ): idx
-                    for idx, probe, rep_idx, seed in baseline_tasks
-                }
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    record, _ = future.result()
-                    no_system_records[idx] = record
-                    completed += 1
+                    )
+                    append_jsonl_threadsafe(baseline_no_system_path, record)
+                    completed_no_system_ids.add(run_id)
+                    completed_no_system += 1
                     logger.info(
                         "Baseline no-system: probe=%s rep=%d (%d/%d)",
                         record.get("probe_id"),
                         record.get("repetition_index"),
-                        completed,
+                        completed_no_system,
                         total,
                     )
-        else:
-            for idx, probe, rep_idx, seed in baseline_tasks:
-                logger.info("Baseline no-system: probe=%s rep=%d (%d/%d)", probe.get("probe_id"), rep_idx, idx + 1, total)
-                record, _ = _single_call_record(
-                    provider=provider,
-                    config=config,
-                    probe=probe,
-                    system_prompt=system_prompt,
-                    filler_messages=[],
-                    include_system=False,
-                    depth_target_tokens=0,
-                    run_type="baseline_no_system",
-                    overhead_calibrated=overhead_calibrated,
-                    seed_override=seed,
-                    repetition_index=rep_idx,
-                )
-                no_system_records[idx] = record
 
-    # -- Write outputs ----------------------------------------------------
-    baseline_system_path = raw_dir / "baseline_system.jsonl"
-    baseline_no_system_path = raw_dir / "baseline_no_system.jsonl"
-    calibration_path = config.results_dir / "calibration.json"
-    baselines_summary_path = config.results_dir / "baselines.json"
-    write_jsonl(baseline_system_path, system_records)  # type: ignore[arg-type]
-    write_jsonl(baseline_no_system_path, no_system_records)  # type: ignore[arg-type]
-    write_json(calibration_path, {"overhead_calibrated": overhead_calibrated})
+    final_system_records = read_jsonl(baseline_system_path)
+    final_no_system_records = read_jsonl(baseline_no_system_path)
+    final_system_count = sum(1 for row in final_system_records if str(row.get("run_id")) in expected_system_run_ids)
+    final_no_system_count = sum(
+        1 for row in final_no_system_records if str(row.get("run_id")) in expected_no_system_run_ids
+    )
     write_json(
         baselines_summary_path,
         {
             "overhead_calibrated": overhead_calibrated,
-            "baseline_system_count": len(system_records),
-            "baseline_no_system_count": len(no_system_records),
+            "baseline_system_count": final_system_count,
+            "baseline_no_system_count": final_no_system_count,
             "generated_at": _now_iso(),
         },
     )
     logger.info(
         "Baselines complete: system=%d no_system=%d files=[%s, %s, %s, %s]",
-        len(system_records),
-        len(no_system_records),
+        final_system_count,
+        final_no_system_count,
         baseline_system_path,
         baseline_no_system_path,
         calibration_path,
@@ -569,18 +737,49 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
     max_workers = max(1, config.max_workers)
     total_depths = len(config.depth_targets)
     total_calls = total_depths * len(directives) * config.repetitions
+
+    raw_dir = config.results_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    sweep_path = raw_dir / "sweep.jsonl"
+
+    existing_rows = read_jsonl(sweep_path)
+    expected_run_ids: set[str] = set()
+    for depth_target in config.depth_targets:
+        for directive_id in directives:
+            directive_probes = probes_by_directive[directive_id]
+            for rep_idx in range(config.repetitions):
+                probe = directive_probes[rep_idx % len(directive_probes)]
+                expected_run_ids.add(
+                    _build_run_id(
+                        run_type="sweep",
+                        depth_target_tokens=depth_target,
+                        probe_id=str(probe["probe_id"]),
+                        repetition_index=rep_idx,
+                    )
+                )
+
+    completed_run_ids = {
+        str(row.get("run_id"))
+        for row in existing_rows
+        if str(row.get("run_id")) in expected_run_ids
+    }
+
     logger.info(
-        "Starting depth sweep: depths=%d directives=%d repetitions=%d total_calls=%d overhead=%d max_workers=%d",
+        "Starting depth sweep: depths=%d directives=%d repetitions=%d total_calls=%d overhead=%d max_workers=%d use_batch=%s",
         total_depths,
         len(directives),
         config.repetitions,
         total_calls,
         overhead_calibrated,
         max_workers,
+        config.use_batch,
     )
-
-    raw_dir = config.results_dir / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Resuming sweep: existing=%d remaining=%d total=%d",
+        len(completed_run_ids),
+        total_calls - len(completed_run_ids),
+        total_calls,
+    )
 
     # Pre-load filler for all depths so we can submit all calls at once.
     filler_by_depth: Dict[int, Sequence] = {}
@@ -592,27 +791,38 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
             len(filler_by_depth[depth_target]),
         )
 
-    # Build ordered task list: (global_idx, depth_target, probe, repetition_index, seed)
-    tasks: List[Tuple[int, int, Dict, int, int]] = []
+    # Build remaining tasks only.
+    tasks: List[Tuple[int, int, Dict, int, int, str]] = []
     for depth_target in config.depth_targets:
         for directive_id in directives:
             directive_probes = probes_by_directive[directive_id]
             for rep_idx in range(config.repetitions):
                 probe = directive_probes[rep_idx % len(directive_probes)]
                 seed = config.seed + rep_idx
-                tasks.append((len(tasks), depth_target, probe, rep_idx, seed))
+                run_id = _build_run_id(
+                    run_type="sweep",
+                    depth_target_tokens=depth_target,
+                    probe_id=str(probe["probe_id"]),
+                    repetition_index=rep_idx,
+                )
+                if run_id in completed_run_ids:
+                    continue
+                tasks.append((len(tasks), depth_target, probe, rep_idx, seed, run_id))
 
-    rows: List[Optional[Dict]] = [None] * len(tasks)
+    if not tasks:
+        logger.info("Depth sweep already complete for current config. output=%s", sweep_path)
+        return
 
+    completed_count = len(completed_run_ids)
     if config.use_batch:
         logger.info(
-            "Sweep batch mode enabled: submitting %d requests poll_interval=%d",
+            "Sweep batch mode enabled: submitting remaining requests=%d poll_interval=%d",
             len(tasks),
             config.batch_poll_interval,
         )
         task_meta: List[Dict] = []
         batch_requests: List[BatchRequest] = []
-        for global_idx, depth_target, probe, rep_idx, seed in tasks:
+        for _, depth_target, probe, rep_idx, seed, run_id in tasks:
             prefix, messages = _build_call_messages(
                 system_prompt=system_prompt,
                 filler_messages=filler_by_depth[depth_target],
@@ -621,10 +831,10 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
             )
             depth_tokens_planned = estimate_messages_tokens(prefix, config.openai_model)
             probe_tokens_estimate = estimate_text_tokens(probe["user_message"], config.openai_model)
-            custom_id = f"sweep-{depth_target}-{global_idx}-{probe['probe_id']}-r{rep_idx}"
+            custom_id = f"sweep-{depth_target}-{probe['probe_id']}-r{rep_idx}"
             task_meta.append(
                 {
-                    "global_idx": global_idx,
+                    "run_id": run_id,
                     "custom_id": custom_id,
                     "probe": probe,
                     "rep_idx": rep_idx,
@@ -651,7 +861,7 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
             requests=batch_requests,
             poll_interval=config.batch_poll_interval,
         )
-        for completed, meta in enumerate(task_meta, start=1):
+        for meta in task_meta:
             completion = results[meta["custom_id"]]
             record, _ = _build_record_from_completion(
                 completion=completion,
@@ -665,10 +875,12 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
                 depth_tokens_planned=meta["depth_tokens_planned"],
                 probe_tokens_estimate=meta["probe_tokens_estimate"],
             )
-            rows[meta["global_idx"]] = record
+            append_jsonl_threadsafe(sweep_path, record)
+            completed_run_ids.add(meta["run_id"])
+            completed_count += 1
             logger.info(
                 "Sweep (%d/%d): depth=%d probe=%s rep=%d",
-                completed,
+                completed_count,
                 total_calls,
                 record.get("depth_target_tokens"),
                 record.get("probe_id"),
@@ -676,9 +888,8 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
             )
     else:
         if max_workers > 1:
-            completed = 0
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {
+                future_to_task = {
                     executor.submit(
                         _single_call_record,
                         provider=provider,
@@ -692,32 +903,25 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
                         overhead_calibrated=overhead_calibrated,
                         seed_override=seed,
                         repetition_index=rep_idx,
-                    ): global_idx
-                    for global_idx, depth_target, probe, rep_idx, seed in tasks
+                    ): run_id
+                    for _, depth_target, probe, rep_idx, seed, run_id in tasks
                 }
-                for future in as_completed(future_to_idx):
-                    global_idx = future_to_idx[future]
+                for future in as_completed(future_to_task):
+                    run_id = future_to_task[future]
                     record, _ = future.result()
-                    rows[global_idx] = record
-                    completed += 1
+                    append_jsonl_threadsafe(sweep_path, record)
+                    completed_run_ids.add(run_id)
+                    completed_count += 1
                     logger.info(
                         "Sweep (%d/%d): depth=%d probe=%s rep=%d",
-                        completed,
+                        completed_count,
                         total_calls,
                         record.get("depth_target_tokens"),
                         record.get("probe_id"),
                         record.get("repetition_index"),
                     )
         else:
-            for global_idx, depth_target, probe, rep_idx, seed in tasks:
-                logger.info(
-                    "Sweep (%d/%d): depth=%d probe=%s rep=%d",
-                    global_idx + 1,
-                    total_calls,
-                    depth_target,
-                    probe.get("probe_id"),
-                    rep_idx,
-                )
+            for _, depth_target, probe, rep_idx, seed, run_id in tasks:
                 record, _ = _single_call_record(
                     provider=provider,
                     config=config,
@@ -731,8 +935,18 @@ def run_sweep(config: AppConfig, provider: ModelProvider) -> None:
                     seed_override=seed,
                     repetition_index=rep_idx,
                 )
-                rows[global_idx] = record
+                append_jsonl_threadsafe(sweep_path, record)
+                completed_run_ids.add(run_id)
+                completed_count += 1
+                logger.info(
+                    "Sweep (%d/%d): depth=%d probe=%s rep=%d",
+                    completed_count,
+                    total_calls,
+                    record.get("depth_target_tokens"),
+                    record.get("probe_id"),
+                    record.get("repetition_index"),
+                )
 
-    sweep_path = raw_dir / "sweep.jsonl"
-    write_jsonl(sweep_path, rows)  # type: ignore[arg-type]
-    logger.info("Depth sweep complete: rows=%d output=%s", len(rows), sweep_path)
+    final_rows = read_jsonl(sweep_path)
+    final_count = sum(1 for row in final_rows if str(row.get("run_id")) in expected_run_ids)
+    logger.info("Depth sweep complete: rows=%d output=%s", final_count, sweep_path)
